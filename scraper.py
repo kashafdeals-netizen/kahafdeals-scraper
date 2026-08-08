@@ -1,13 +1,18 @@
 """
-Kashafdeals Channel Scraper — GitHub Actions edition
-Polls Telegram channels every 10 min, swaps affiliate tags, posts to @kashafdeals.
-No server needed — runs entirely on GitHub's free infrastructure.
+Kashafdeals Channel Scraper — GitHub Actions + Telethon edition
+Uses Telethon to read any Telegram channel (even join-required ones),
+GitHub Actions for free scheduling, Bot API to post to @kashafdeals.
 """
-import json, os, re, sys, time
+import asyncio, json, os, re, sys, time
 import requests
-from bs4 import BeautifulSoup, NavigableString
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage
 
 # ── Config from GitHub Secrets ────────────────────────────────────────────────
+API_ID        = int(os.environ["TELEGRAM_API_ID"])
+API_HASH      = os.environ["TELEGRAM_API_HASH"]
+SESSION_STR   = os.environ["TELEGRAM_SESSION"]
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 DEST_CHANNEL  = os.environ.get("DEST_CHANNEL", "@kashafdeals")
 AFFILIATE_TAG = os.environ.get("AFFILIATE_TAG", "kashafdeals-21")
@@ -19,9 +24,8 @@ CHANNELS      = [
 
 STATE_FILE   = "state.json"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-HEADERS      = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-# ── State (tracks last seen post ID per channel) ──────────────────────────────
+# ── State management ──────────────────────────────────────────────────────────
 def load_state():
     if os.path.exists(STATE_FILE):
         try: return json.load(open(STATE_FILE, encoding="utf-8"))
@@ -46,127 +50,89 @@ def swap_tag(text):
         return url
     return _AMAZON_RE.sub(_add, result)
 
-# ── HTML → plain text (preserving actual link URLs) ───────────────────────────
-def extract_text(el):
-    parts = []
-    for child in el.children:
-        if isinstance(child, NavigableString):
-            parts.append(str(child))
-        elif child.name == "a":
-            href = child.get("href", "")
-            parts.append(href if href.startswith("http") else child.get_text())
-        elif child.name == "br":
-            parts.append("\n")
-        else:
-            parts.append(extract_text(child))
-    return "".join(parts)
-
-# ── Scrape t.me/s/channel ─────────────────────────────────────────────────────
-def fetch_posts(channel):
-    try:
-        r = requests.get(f"https://t.me/s/{channel}", headers=HEADERS, timeout=20)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"[{channel}] Fetch error: {e}"); return []
-
-    soup  = BeautifulSoup(r.text, "html.parser")
-    posts = []
-
-    for wrap in soup.select(".tgme_widget_message_wrap"):
-        msg = wrap.select_one(".tgme_widget_message")
-        if not msg: continue
-
-        data_post = msg.get("data-post", "")
-        if "/" not in data_post: continue
-        try:
-            post_id = int(data_post.split("/")[-1])
-        except ValueError:
-            continue
-
-        # Text — use actual href for links, not display text
-        text_el = msg.select_one(".tgme_widget_message_text")
-        text    = extract_text(text_el).strip() if text_el else ""
-
-        # Image — from CSS background-image on the photo wrap
-        image_url = None
-        photo = msg.select_one("a.tgme_widget_message_photo_wrap")
-        if photo:
-            m = re.search(r"url\(['\"]?(.+?)['\"]?\)", photo.get("style", ""))
-            if m: image_url = m.group(1)
-
-        posts.append({"id": post_id, "text": text, "image_url": image_url})
-
-    return sorted(posts, key=lambda x: x["id"])
-
-# ── Post to Telegram via Bot API ──────────────────────────────────────────────
-def send_post(text, image_url=None):
+# ── Post to @kashafdeals via Bot API ─────────────────────────────────────────
+def send_post(text, photo_bytes=None):
     caption = swap_tag(text)
 
-    if image_url:
-        try:
-            img = requests.get(image_url, headers=HEADERS, timeout=30)
-            img.raise_for_status()
-            r = requests.post(
-                f"{TELEGRAM_API}/sendPhoto",
-                data={"chat_id": DEST_CHANNEL, "caption": caption},
-                files={"photo": ("photo.jpg", img.content, "image/jpeg")},
-                timeout=60,
-            )
-            resp = r.json()
-            if resp.get("ok"): return True
-            print(f"  sendPhoto failed: {resp.get('description')} — falling back to text")
-        except Exception as e:
-            print(f"  Image error: {e} — falling back to text")
+    if photo_bytes:
+        r = requests.post(
+            f"{TELEGRAM_API}/sendPhoto",
+            data={"chat_id": DEST_CHANNEL, "caption": caption},
+            files={"photo": ("photo.jpg", photo_bytes, "image/jpeg")},
+            timeout=60,
+        )
+        resp = r.json()
+        if resp.get("ok"):
+            return True
+        print(f"  sendPhoto failed: {resp.get('description')} — trying text only")
 
-    # Text-only fallback
+    # Text-only (or fallback)
     r = requests.post(
         f"{TELEGRAM_API}/sendMessage",
-        json={"chat_id": DEST_CHANNEL, "text": caption},
+        json={"chat_id": DEST_CHANNEL, "text": caption,
+              "disable_web_page_preview": False},
         timeout=30,
     )
-    return r.json().get("ok", False)
+    resp = r.json()
+    if not resp.get("ok"):
+        print(f"  sendMessage failed: {resp.get('description')}")
+    return resp.get("ok", False)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    state  = load_state()
-    total  = 0
-    errors = 0
+# ── Main (async — Telethon requires asyncio) ──────────────────────────────────
+async def run():
+    state = load_state()
+    total = 0
 
-    for channel in CHANNELS:
-        print(f"\n── @{channel} ──")
-        posts = fetch_posts(channel)
+    async with TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH) as client:
+        me = await client.get_me()
+        print(f"Logged in as: {me.first_name} (@{me.username})")
 
-        if not posts:
-            print("  No posts found (channel private or scrape failed)")
-            continue
+        for channel in CHANNELS:
+            print(f"\n── @{channel} ──")
+            last_id = state.get(channel, 0)
 
-        last_id = state.get(channel, 0)
+            try:
+                messages = await client.get_messages(channel, limit=20)
+            except Exception as e:
+                print(f"  Error fetching messages: {e}")
+                continue
 
-        # First run: record current latest ID without posting old content
-        if last_id == 0:
-            new_last = max(p["id"] for p in posts)
-            state[channel] = new_last
-            print(f"  First run — saving latest ID: {new_last} (no posting yet)")
-            continue
+            if not messages:
+                print("  No messages found")
+                continue
 
-        new_posts = [p for p in posts if p["id"] > last_id]
-        print(f"  {len(new_posts)} new post(s) since ID {last_id}")
+            # First run: record latest ID without posting old content
+            if last_id == 0:
+                new_last = max(m.id for m in messages)
+                state[channel] = new_last
+                print(f"  First run — saved latest ID: {new_last} (no posting)")
+                continue
 
-        for post in new_posts:
-            has_tag = "tag=" in post["text"]
-            ok = send_post(post["text"], post["image_url"])
-            print(f"  Post {post['id']}: {'OK' if ok else 'FAILED'} | "
-                  f"has_affiliate: {has_tag} | has_image: {post['image_url'] is not None}")
-            if ok:
-                state[channel] = post["id"]
-                total += 1
-            else:
-                errors += 1
-            time.sleep(2)  # avoid hitting Telegram rate limits
+            new_msgs = [m for m in reversed(messages) if m.id > last_id]
+            print(f"  {len(new_msgs)} new message(s) since ID {last_id}")
+
+            for msg in new_msgs:
+                text        = msg.message or ""
+                photo_bytes = None
+
+                # Download photo
+                if isinstance(msg.media, MessageMediaPhoto):
+                    try:
+                        photo_bytes = await client.download_media(msg.media, bytes)
+                    except Exception as e:
+                        print(f"  Photo download error: {e}")
+
+                ok = send_post(text, photo_bytes)
+                print(f"  Msg {msg.id}: {'OK' if ok else 'FAILED'} | "
+                      f"has_tag: {'tag=' in text} | "
+                      f"has_photo: {photo_bytes is not None}")
+                if ok:
+                    state[channel] = msg.id
+                    total += 1
+                time.sleep(2)  # gentle rate limit
 
     save_state(state)
-    print(f"\n── Done: posted={total}, errors={errors} ──")
-    if errors: sys.exit(1)
+    print(f"\nDone. Posted: {total}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run())

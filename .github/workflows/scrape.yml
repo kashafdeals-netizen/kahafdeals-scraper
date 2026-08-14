@@ -21,17 +21,14 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests "telethon==1.36.0"
+        run: pip install requests beautifulsoup4
 
       - name: Run scraper
         env:
-          TELEGRAM_API_ID:  ${{ secrets.TELEGRAM_API_ID }}
-          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
-          BOT_TOKEN:        ${{ secrets.BOT_TOKEN }}
-          DEST_CHANNEL:     ${{ secrets.DEST_CHANNEL }}
-          AFFILIATE_TAG:    ${{ secrets.AFFILIATE_TAG }}
-          CHANNELS:         ${{ secrets.CHANNELS }}
+          BOT_TOKEN:     ${{ secrets.BOT_TOKEN }}
+          DEST_CHANNEL:  ${{ secrets.DEST_CHANNEL }}
+          AFFILIATE_TAG: ${{ secrets.AFFILIATE_TAG }}
+          MAX_PER_RUN:   ${{ secrets.MAX_PER_RUN }}
         run: python scraper.py
 
       - name: Save state back to repo
@@ -39,6 +36,6 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state.json
-          git diff --staged --quiet || git commit -m "state: update last seen IDs"
+          git diff --staged --quiet || git commit -m "state: update posted ASINs"
           git pull origin main --no-rebase -X ours || true
           git push origin main

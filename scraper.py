@@ -1,10 +1,13 @@
 """
 Kashafdeals Amazon.eg Direct Scraper
-Uses Amazon search pages (server-side rendered) sorted by discount.
-Posts discounted items to @kashafdeals via Telegram Bot API.
+- Scrapes discounted items from Amazon.eg search pages
+- Takes real browser screenshot of each product page
+- Extracts Arabic title from rendered page
+- Posts to @kashafdeals in old-style caption format
 """
 import json, os, re, time, requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 DEST_CHANNEL  = os.environ.get("DEST_CHANNEL", "@kashafdeals")
@@ -23,7 +26,7 @@ CATEGORIES = {
     "supermarket": "https://www.amazon.eg/s?i=grocery&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
 }
 
-HEADERS = {
+SCRAPE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -32,15 +35,6 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
-}
-
-CATEGORY_LABELS = {
-    "deals":       "🔥 عروض اليوم",
-    "electronics": "📱 إلكترونيات",
-    "beauty":      "💄 جمال وعناية",
-    "fashion":     "👗 أزياء وموضة",
-    "home":        "🏠 المنزل والمطبخ",
-    "supermarket": "🛒 سوبرماركت",
 }
 
 def load_state():
@@ -75,7 +69,7 @@ def parse_price(text):
 def fetch_html(url):
     for attempt in range(3):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=25)
+            r = requests.get(url, headers=SCRAPE_HEADERS, timeout=25)
             print(f"  HTTP {r.status_code}")
             if r.status_code == 200:
                 return r.text
@@ -83,6 +77,55 @@ def fetch_html(url):
             print(f"  Fetch error (attempt {attempt+1}): {e}")
         time.sleep(4)
     return None
+
+def get_product_screenshot_and_title(asin):
+    url = f"https://www.amazon.eg/dp/{asin}"
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            ctx = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                locale="ar-EG",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0.0.0 Safari/537.36"
+                ),
+            )
+            page = ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(3000)
+
+            arabic_title = ""
+            for sel in ["#productTitle", "h1 span", "h1"]:
+                try:
+                    el = page.query_selector(sel)
+                    if el:
+                        t = el.inner_text().strip()
+                        if t:
+                            arabic_title = t
+                            break
+                except Exception:
+                    pass
+
+            screenshot_bytes = None
+            for sel in ["#ppd", "#dp-container", "#dp", "body"]:
+                try:
+                    el = page.query_selector(sel)
+                    if el:
+                        screenshot_bytes = el.screenshot()
+                        break
+                except Exception:
+                    pass
+            if not screenshot_bytes:
+                screenshot_bytes = page.screenshot()
+
+            browser.close()
+            return screenshot_bytes, arabic_title
+
+    except Exception as e:
+        print(f"  Browser error for {asin}: {e}")
+        return None, ""
 
 def parse_search_results(html, category):
     soup  = BeautifulSoup(html, "html.parser")
@@ -155,32 +198,40 @@ def parse_search_results(html, category):
 
     return items
 
-def build_caption(item):
-    label = CATEGORY_LABELS.get(item["category"], "🛍️ عرض")
-    link  = make_link(item["asin"])
-    lines = [label, "", f"📦 {item['title']}", ""]
+def build_caption(item, arabic_title):
+    name = arabic_title if arabic_title else item["title"]
+    link = make_link(item["asin"])
+    lines = []
+
+    if item.get("discount_pct", 0) >= 10:
+        lines.append(f"🔥 خصم {item['discount_pct']}% 🔥")
+
+    lines.append(f"👑 عرض على {name}")
+    lines.append("")
 
     if item.get("current_price") and item.get("original_price"):
-        lines += [
-            f"💰 السعر: {item['current_price']:,.0f} ج.م",
-            f"~~كان: {item['original_price']:,.0f} ج.م~~",
-        ]
+        lines.append(
+            f"💰 السعر: {item['current_price']:,.0f} جنيه"
+            f" بدلا من {item['original_price']:,.0f} جنيه في موقعهم الرسمي"
+        )
     elif item.get("current_price"):
-        lines.append(f"💰 السعر: {item['current_price']:,.0f} ج.م")
+        lines.append(f"💰 السعر: {item['current_price']:,.0f} جنيه")
 
-    if item.get("discount_pct"):
-        lines.append(f"🏷️ خصم {item['discount_pct']}%")
-
-    lines += ["", f"🛒 {link}"]
+    lines.append("")
+    lines.append(f"لينك الشراء: {link}")
     return "\n".join(lines)
 
 def post_item(item):
-    caption     = build_caption(item)
-    photo_bytes = None
+    print(f"  Launching browser for {item['asin']}...")
+    screenshot_bytes, arabic_title = get_product_screenshot_and_title(item["asin"])
+    print(f"  Arabic title: {arabic_title[:60] if arabic_title else 'not found'}")
 
-    if item.get("img_url"):
+    caption = build_caption(item, arabic_title)
+
+    photo_bytes = screenshot_bytes
+    if not photo_bytes and item.get("img_url"):
         try:
-            r = requests.get(item["img_url"], headers=HEADERS, timeout=15)
+            r = requests.get(item["img_url"], headers=SCRAPE_HEADERS, timeout=15)
             if r.status_code == 200 and "image" in r.headers.get("Content-Type", ""):
                 photo_bytes = r.content
         except Exception:
@@ -215,7 +266,6 @@ def main():
 
         print(f"\n{'='*40}")
         print(f"Category: {category}")
-        print(f"URL: {url}")
 
         html = fetch_html(url)
         if not html:
@@ -241,7 +291,7 @@ def main():
                 state["posted"] = list(posted_set)
                 total += 1
 
-            time.sleep(3)
+            time.sleep(2)
 
     save_state(state)
     print(f"\n{'='*40}")

@@ -3,10 +3,12 @@ Kashafdeals Amazon.eg Direct Scraper
 - Scrapes discounted items from Amazon.eg search pages
 - Takes real browser screenshot of each product page
 - Extracts Arabic title from rendered page
-- Posts to @kashafdeals in old-style caption format
+- Posts in old-style caption format
+- State expires after 48h so items can recycle
 """
 import json, os, re, time, requests
 from bs4 import BeautifulSoup
+from datetime import datetime, timezone
 from playwright.sync_api import sync_playwright
 
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
@@ -16,13 +18,14 @@ MAX_PER_RUN   = int(os.environ.get("MAX_PER_RUN", "3"))
 
 TELEGRAM_API  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_FILE    = "state.json"
+EXPIRY_HOURS  = 48
 
 CATEGORIES = {
-    "deals":       "https://www.amazon.eg/s?i=aps&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "deals":       "https://www.amazon.eg/s?s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
     "electronics": "https://www.amazon.eg/s?i=electronics&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
     "beauty":      "https://www.amazon.eg/s?i=beauty&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
-    "fashion":     "https://www.amazon.eg/s?i=fashion-womens&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
-    "home":        "https://www.amazon.eg/s?i=kitchen&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "fashion":     "https://www.amazon.eg/s?i=apparel&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "home":        "https://www.amazon.eg/s?i=home-kitchen&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
     "supermarket": "https://www.amazon.eg/s?i=grocery&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
 }
 
@@ -37,21 +40,44 @@ SCRAPE_HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
 }
 
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
             data = json.load(open(STATE_FILE, encoding="utf-8"))
+            if isinstance(data.get("posted"), list):
+                return {"posted": {}}
             if "posted" not in data:
-                return {"posted": []}
+                return {"posted": {}}
             return data
         except Exception:
             pass
-    return {"posted": []}
+    return {"posted": {}}
 
 def save_state(state):
-    posted = list(set(state.get("posted", [])))[-1000:]
+    now = datetime.now(timezone.utc)
+    pruned = {}
+    for asin, ts in state.get("posted", {}).items():
+        try:
+            posted_at = datetime.fromisoformat(ts)
+            if (now - posted_at).total_seconds() < EXPIRY_HOURS * 3600:
+                pruned[asin] = ts
+        except Exception:
+            pass
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"posted": posted}, f, indent=2)
+        json.dump({"posted": pruned}, f, indent=2)
+
+def is_already_posted(posted_dict, asin):
+    if asin not in posted_dict:
+        return False
+    try:
+        posted_at = datetime.fromisoformat(posted_dict[asin])
+        hours_ago = (datetime.now(timezone.utc) - posted_at).total_seconds() / 3600
+        return hours_ago < EXPIRY_HOURS
+    except Exception:
+        return False
 
 def make_link(asin):
     return f"https://www.amazon.eg/dp/{asin}?tag={AFFILIATE_TAG}"
@@ -96,6 +122,7 @@ def get_product_screenshot_and_title(asin):
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(3000)
 
+            # Extract Arabic title
             arabic_title = ""
             for sel in ["#productTitle", "h1 span", "h1"]:
                 try:
@@ -108,17 +135,10 @@ def get_product_screenshot_and_title(asin):
                 except Exception:
                     pass
 
-            screenshot_bytes = None
-            for sel in ["#ppd", "#dp-container", "#dp", "body"]:
-                try:
-                    el = page.query_selector(sel)
-                    if el:
-                        screenshot_bytes = el.screenshot()
-                        break
-                except Exception:
-                    pass
-            if not screenshot_bytes:
-                screenshot_bytes = page.screenshot()
+            # Scroll to top so screenshot shows title + image + price
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_timeout(500)
+            screenshot_bytes = page.screenshot(full_page=False)
 
             browser.close()
             return screenshot_bytes, arabic_title
@@ -228,7 +248,9 @@ def post_item(item):
 
     caption = build_caption(item, arabic_title)
 
-    photo_bytes = screenshot_bytes
+    # Only use screenshot if we got a real product title (not a login/captcha page)
+    photo_bytes = screenshot_bytes if arabic_title else None
+
     if not photo_bytes and item.get("img_url"):
         try:
             r = requests.get(item["img_url"], headers=SCRAPE_HEADERS, timeout=15)
@@ -256,9 +278,9 @@ def post_item(item):
     return r.json().get("ok", False)
 
 def main():
-    state      = load_state()
-    posted_set = set(state.get("posted", []))
-    total      = 0
+    state       = load_state()
+    posted_dict = state.get("posted", {})
+    total       = 0
 
     for category, url in CATEGORIES.items():
         if total >= MAX_PER_RUN:
@@ -278,8 +300,8 @@ def main():
         for item in items:
             if total >= MAX_PER_RUN:
                 break
-            if item["asin"] in posted_set:
-                print(f"  Skip {item['asin']} — already posted")
+            if is_already_posted(posted_dict, item["asin"]):
+                print(f"  Skip {item['asin']} — posted within {EXPIRY_HOURS}h")
                 continue
 
             ok = post_item(item)
@@ -287,8 +309,8 @@ def main():
             print(f"  [{status}] {item['asin']} | {item['discount_pct']}% off | {item['title'][:50]}")
 
             if ok:
-                posted_set.add(item["asin"])
-                state["posted"] = list(posted_set)
+                posted_dict[item["asin"]] = now_iso()
+                state["posted"] = posted_dict
                 total += 1
 
             time.sleep(2)

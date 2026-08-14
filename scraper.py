@@ -1,12 +1,11 @@
 """
 Kashafdeals Amazon.eg Direct Scraper
-Scrapes discounted items from Amazon.eg deals + category pages.
-Posts to @kashafdeals via Telegram Bot API.
+Uses Amazon search pages (server-side rendered) sorted by discount.
+Posts discounted items to @kashafdeals via Telegram Bot API.
 """
 import json, os, re, time, requests
 from bs4 import BeautifulSoup
 
-# ── Config ─────────────────────────────────────────────────────────────────
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 DEST_CHANNEL  = os.environ.get("DEST_CHANNEL", "@kashafdeals")
 AFFILIATE_TAG = os.environ.get("AFFILIATE_TAG", "kashafdeals-21")
@@ -16,12 +15,12 @@ TELEGRAM_API  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_FILE    = "state.json"
 
 CATEGORIES = {
-    "deals":       "https://www.amazon.eg/gp/goldbox/",
-    "electronics": "https://www.amazon.eg/gp/bestsellers/electronics/",
-    "beauty":      "https://www.amazon.eg/gp/bestsellers/beauty/",
-    "fashion":     "https://www.amazon.eg/gp/bestsellers/apparel/",
-    "home":        "https://www.amazon.eg/gp/bestsellers/home-kitchen/",
-    "supermarket": "https://www.amazon.eg/gp/bestsellers/grocery/",
+    "deals":       "https://www.amazon.eg/s?i=aps&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "electronics": "https://www.amazon.eg/s?i=electronics&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "beauty":      "https://www.amazon.eg/s?i=beauty&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "fashion":     "https://www.amazon.eg/s?i=fashion-womens&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "home":        "https://www.amazon.eg/s?i=kitchen&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "supermarket": "https://www.amazon.eg/s?i=grocery&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
 }
 
 HEADERS = {
@@ -44,33 +43,30 @@ CATEGORY_LABELS = {
     "supermarket": "🛒 سوبرماركت",
 }
 
-# ── State ──────────────────────────────────────────────────────────────────
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
-            return json.load(open(STATE_FILE, encoding="utf-8"))
+            data = json.load(open(STATE_FILE, encoding="utf-8"))
+            if "posted" not in data:
+                return {"posted": []}
+            return data
         except Exception:
             pass
     return {"posted": []}
 
 def save_state(state):
-    state["posted"] = list(set(state["posted"]))[-1000:]
+    posted = list(set(state.get("posted", [])))[-1000:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
+        json.dump({"posted": posted}, f, indent=2)
 
-# ── Helpers ────────────────────────────────────────────────────────────────
 def make_link(asin):
     return f"https://www.amazon.eg/dp/{asin}?tag={AFFILIATE_TAG}"
-
-def extract_asin(url_or_card):
-    m = re.search(r"/dp/([A-Z0-9]{10})", str(url_or_card))
-    return m.group(1) if m else None
 
 def parse_price(text):
     if not text:
         return None
-    text = text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩٫٬،,", "0123456789...  "))
-    text = re.sub(r"[^\d.]", "", text.replace("EGP", "").replace("ج.م", "").strip())
+    text = text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
+    text = re.sub(r"[^\d.]", "", text.replace("EGP", "").replace("ج.م", "").replace(",", "").strip())
     try:
         return float(text) if text else None
     except ValueError:
@@ -80,69 +76,57 @@ def fetch_html(url):
     for attempt in range(3):
         try:
             r = requests.get(url, headers=HEADERS, timeout=25)
+            print(f"  HTTP {r.status_code}")
             if r.status_code == 200:
                 return r.text
-            print(f"  HTTP {r.status_code}")
         except Exception as e:
             print(f"  Fetch error (attempt {attempt+1}): {e}")
         time.sleep(4)
     return None
 
-# ── Parsers ────────────────────────────────────────────────────────────────
-def parse_bestsellers(html, category):
+def parse_search_results(html, category):
     soup  = BeautifulSoup(html, "html.parser")
     items = []
 
-    title = soup.title.get_text(strip=True) if soup.title else "no title"
-    print(f"  Page title: {title}")
+    page_title = soup.title.get_text(strip=True) if soup.title else "no title"
+    print(f"  Page title: {page_title}")
 
-    cards = (
-        soup.select("div[id^='p13n-asin-index-']") or
-        soup.select("li[id^='p13n-asin-index-']") or
-        soup.select("[data-asin]")
-    )
-    print(f"  Cards found: {len(cards)}")
+    cards = soup.select("div[data-component-type='s-search-result']")
+    print(f"  Result cards found: {len(cards)}")
 
     for card in cards:
         try:
-            asin = card.get("data-asin") or ""
-            if not asin:
-                link = card.select_one("a[href*='/dp/']")
-                if link:
-                    asin = extract_asin(link.get("href", "")) or ""
+            asin = card.get("data-asin", "")
             if not asin or len(asin) != 10:
                 continue
 
-            title_el = (
-                card.select_one("._cDEzb_p13n-sc-css-line-clamp-3_g3dy1") or
-                card.select_one("div[class*='line-clamp']") or
-                card.select_one(".a-link-normal span") or
-                card.select_one("span.a-text-normal")
-            )
+            title_el = card.select_one("h2 span") or card.select_one("h2 a span")
             title = title_el.get_text(strip=True) if title_el else ""
             if not title:
                 continue
 
-            current_price = original_price = None
-            for p in card.select(".a-price"):
-                raw = p.get_text(" ", strip=True)
-                val = parse_price(raw)
-                if val is None:
-                    continue
-                if p.get("data-a-strike") == "true" or "a-text-strike" in p.get("class", []):
-                    original_price = val
-                else:
-                    if current_price is None:
+            current_price = None
+            for price_el in card.select(".a-price:not(.a-text-price)"):
+                raw = price_el.select_one(".a-offscreen")
+                if raw:
+                    val = parse_price(raw.get_text())
+                    if val and val > 0:
                         current_price = val
+                        break
 
-            disc_el = (
-                card.select_one(".savingsPercentage") or
-                card.select_one("[class*='discount']") or
-                card.select_one("[class*='saving']")
-            )
+            original_price = None
+            for price_el in card.select(".a-text-price"):
+                raw = price_el.select_one(".a-offscreen")
+                if raw:
+                    val = parse_price(raw.get_text())
+                    if val and val > 0:
+                        original_price = val
+                        break
+
             discount_pct = 0
-            if disc_el:
-                m = re.search(r"(\d+)", disc_el.get_text())
+            badge = card.select_one(".a-badge-text") or card.select_one("[class*='savingsPercentage']")
+            if badge:
+                m = re.search(r"(\d+)", badge.get_text())
                 if m:
                     discount_pct = int(m.group(1))
             if not discount_pct and current_price and original_price and original_price > current_price:
@@ -151,10 +135,10 @@ def parse_bestsellers(html, category):
             if discount_pct < 5:
                 continue
 
-            img_el  = card.select_one("img")
+            img_el  = card.select_one("img.s-image") or card.select_one("img")
             img_url = ""
             if img_el:
-                img_url = img_el.get("src") or img_el.get("data-src") or ""
+                img_url = img_el.get("src", "")
                 if img_url.startswith("//"):
                     img_url = "https:" + img_url
 
@@ -171,78 +155,6 @@ def parse_bestsellers(html, category):
 
     return items
 
-def parse_deals_page(html):
-    soup  = BeautifulSoup(html, "html.parser")
-    items = []
-
-    title = soup.title.get_text(strip=True) if soup.title else "no title"
-    print(f"  Page title: {title}")
-
-    cards = soup.select("[data-asin]")
-    print(f"  Cards found: {len(cards)}")
-
-    for card in cards:
-        asin = card.get("data-asin", "")
-        if not asin or len(asin) != 10:
-            continue
-        try:
-            title_el = (
-                card.select_one(".a-truncate-cut") or
-                card.select_one("[class*='DealTitle']") or
-                card.select_one("span.a-text-normal")
-            )
-            title = title_el.get_text(strip=True) if title_el else ""
-            if not title:
-                continue
-
-            disc_el = (
-                card.select_one(".savingsPercentage") or
-                card.select_one("[class*='savings']") or
-                card.select_one("[class*='discount']")
-            )
-            discount_pct = 0
-            if disc_el:
-                m = re.search(r"(\d+)", disc_el.get_text())
-                if m:
-                    discount_pct = int(m.group(1))
-
-            current_price = original_price = None
-            for p in card.select(".a-price"):
-                val = parse_price(p.get_text(" ", strip=True))
-                if val is None:
-                    continue
-                if p.get("data-a-strike") == "true":
-                    original_price = val
-                elif current_price is None:
-                    current_price = val
-
-            if not discount_pct and current_price and original_price and original_price > current_price:
-                discount_pct = round((original_price - current_price) / original_price * 100)
-
-            if discount_pct < 5:
-                continue
-
-            img_el  = card.select_one("img")
-            img_url = ""
-            if img_el:
-                img_url = img_el.get("src") or img_el.get("data-src") or ""
-                if img_url.startswith("//"):
-                    img_url = "https:" + img_url
-
-            items.append({
-                "asin": asin, "title": title,
-                "current_price": current_price,
-                "original_price": original_price,
-                "discount_pct": discount_pct,
-                "img_url": img_url,
-                "category": "deals",
-            })
-        except Exception:
-            continue
-
-    return items
-
-# ── Telegram ───────────────────────────────────────────────────────────────
 def build_caption(item):
     label = CATEGORY_LABELS.get(item["category"], "🛍️ عرض")
     link  = make_link(item["asin"])
@@ -263,7 +175,7 @@ def build_caption(item):
     return "\n".join(lines)
 
 def post_item(item):
-    caption = build_caption(item)
+    caption     = build_caption(item)
     photo_bytes = None
 
     if item.get("img_url"):
@@ -283,7 +195,7 @@ def post_item(item):
         )
         if r.json().get("ok"):
             return True
-        print(f"  sendPhoto failed: {r.json().get('description')} — falling back to text")
+        print(f"  sendPhoto failed: {r.json().get('description')} — trying text")
 
     r = requests.post(
         f"{TELEGRAM_API}/sendMessage",
@@ -292,7 +204,6 @@ def post_item(item):
     )
     return r.json().get("ok", False)
 
-# ── Main ───────────────────────────────────────────────────────────────────
 def main():
     state      = load_state()
     posted_set = set(state.get("posted", []))
@@ -311,7 +222,7 @@ def main():
             print("  SKIPPED — fetch failed")
             continue
 
-        items = parse_deals_page(html) if category == "deals" else parse_bestsellers(html, category)
+        items = parse_search_results(html, category)
         print(f"  Discounted items found: {len(items)}")
 
         for item in items:
@@ -322,8 +233,8 @@ def main():
                 continue
 
             ok = post_item(item)
-            label = "OK" if ok else "FAILED"
-            print(f"  [{label}] {item['asin']} | {item['discount_pct']}% off | {item['title'][:50]}")
+            status = "OK" if ok else "FAILED"
+            print(f"  [{status}] {item['asin']} | {item['discount_pct']}% off | {item['title'][:50]}")
 
             if ok:
                 posted_set.add(item["asin"])

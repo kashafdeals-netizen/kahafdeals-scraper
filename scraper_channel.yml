@@ -1,4 +1,4 @@
-name: Kashafdeals Channel Scraper
+name: Kashafdeals Channel Scraper 2
 
 on:
   workflow_dispatch:

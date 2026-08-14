@@ -14,7 +14,7 @@ AFFILIATE    = "kashafdeals-21"
 STATE_FILE   = "state.json"
 MAX_PER_RUN  = int(os.environ.get("MAX_PER_RUN", "5"))
 EXPIRY_HOURS = 48
-MIN_DISCOUNT = 10  # skip anything below this %
+MIN_DISCOUNT = 10
 
 HEADERS = {
     "User-Agent": (
@@ -117,10 +117,8 @@ def is_posted(asin: str, posted: dict) -> bool:
         return False
 
 def mark_posted(asin: str):
-    # Re-read before writing to avoid stomping a concurrent write
     posted = load_state()
     posted[asin] = datetime.now(timezone.utc).isoformat()
-    # Purge entries older than 2× expiry to keep the file small
     now = datetime.now(timezone.utc)
     clean = {}
     for k, v in posted.items():
@@ -165,7 +163,6 @@ def scrape_category(url: str) -> list:
         if not asin or len(asin) < 8:
             continue
 
-        # Current price
         price_el = item.select_one(".a-price .a-offscreen")
         if not price_el:
             continue
@@ -173,7 +170,6 @@ def scrape_category(url: str) -> list:
         if price <= 0:
             continue
 
-        # Original / struck-through price
         orig_price = 0.0
         for el in item.select(".a-price.a-text-price .a-offscreen"):
             v = parse_price(el.get_text())
@@ -182,7 +178,6 @@ def scrape_category(url: str) -> list:
                 break
 
         if orig_price <= price:
-            # Try to back-calculate from a discount badge
             badge = item.select_one(".savingsPercentage, .a-badge-text")
             if badge:
                 m = re.search(r"(\d+)%", badge.get_text())
@@ -215,14 +210,13 @@ def get_product_details(asin: str, page):
     )
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(2500)  # let lazy elements settle
+        page.wait_for_timeout(2500)
 
         title = ""
         for sel in ["#productTitle", "#title span", "h1.a-size-large"]:
             el = page.query_selector(sel)
             if el:
                 t = el.inner_text().strip()
-                # Must contain at least one Arabic character
                 if re.search(r"[\u0600-\u06FF]", t):
                     title = t
                     break
@@ -246,14 +240,16 @@ def send_telegram(asin, title, price, orig_price, discount_pct, screenshot):
     affiliate_url = f"https://www.amazon.eg/dp/{asin}?tag={AFFILIATE}"
     caption = (
         f"🔥 خصم {discount_pct}% 🔥\n"
+        f"\n"
         f"👑 عرض على {title}\n"
+        f"\n"
         f"💰 السعر: {price:,.0f} جنيه بدلا من {orig_price:,.0f} جنيه\n"
+        f"\n"
         f"🛒 لينك الشراء: {affiliate_url}"
     )
 
     api = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-    # Try with photo first
     try:
         with open(screenshot, "rb") as photo:
             resp = requests.post(
@@ -269,7 +265,6 @@ def send_telegram(asin, title, price, orig_price, discount_pct, screenshot):
     except Exception as e:
         print(f"  [WARN] sendPhoto exception: {e}")
 
-    # Fallback: text-only message
     try:
         resp = requests.post(
             f"{api}/sendMessage",
@@ -294,10 +289,8 @@ def send_telegram(asin, title, price, orig_price, discount_pct, screenshot):
 def main():
     print(f"[START] {datetime.now(timezone.utc).isoformat()}  MAX_PER_RUN={MAX_PER_RUN}")
 
-    # Load state once for the initial filter pass
     posted_snapshot = load_state()
 
-    # Collect unique candidates across all categories, skip already-posted
     seen: set = set()
     candidates: list = []
 
@@ -317,7 +310,6 @@ def main():
                 candidates.append(item)
             time.sleep(1.5)
 
-    # Best discounts first
     candidates.sort(key=lambda x: x["discount_pct"], reverse=True)
     print(f"[INFO] {len(candidates)} unique new candidates")
 
@@ -344,7 +336,6 @@ def main():
             orig_price   = c["orig_price"]
             discount_pct = c["discount_pct"]
 
-            # Re-read state right before posting — catches duplicate from same run
             if is_posted(asin, load_state()):
                 print(f"  [SKIP] {asin} — posted in a parallel check")
                 continue

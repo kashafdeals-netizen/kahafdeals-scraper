@@ -1,327 +1,375 @@
-"""
-Kashafdeals Amazon.eg Direct Scraper
-- Scrapes discounted items from Amazon.eg search pages (page 1 + 2)
-- Takes real browser screenshot of each product page
-- Only posts if Arabic title found (no fallback to product image)
-- Re-reads state before each post to prevent cross-run duplicates
-- State expires after 48h so items can recycle
-"""
-import json, os, re, time, requests
+import os
+import json
+import time
+import re
+import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright
 
-BOT_TOKEN     = os.environ["BOT_TOKEN"]
-DEST_CHANNEL  = os.environ.get("DEST_CHANNEL", "@kashafdeals")
-AFFILIATE_TAG = os.environ.get("AFFILIATE_TAG", "kashafdeals-21")
-MAX_PER_RUN   = int(os.environ.get("MAX_PER_RUN", "15"))
+# ─── Config ──────────────────────────────────────────────────────────────────
+BOT_TOKEN    = os.environ["BOT_TOKEN"]
+CHANNEL      = "@kashafdeals"
+AFFILIATE    = "kashafdeals-21"
+STATE_FILE   = "state.json"
+MAX_PER_RUN  = int(os.environ.get("MAX_PER_RUN", "5"))
+EXPIRY_HOURS = 48
+MIN_DISCOUNT = 10  # skip anything below this %
 
-TELEGRAM_API  = f"https://api.telegram.org/bot{BOT_TOKEN}"
-STATE_FILE    = "state.json"
-EXPIRY_HOURS  = 48
-
-CATEGORIES = {
-    "deals":          "https://www.amazon.eg/s?s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
-    "deals_p2":       "https://www.amazon.eg/s?s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100&page=2",
-    "electronics":    "https://www.amazon.eg/s?i=electronics&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
-    "electronics_p2": "https://www.amazon.eg/s?i=electronics&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100&page=2",
-    "beauty":         "https://www.amazon.eg/s?i=beauty&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
-    "beauty_p2":      "https://www.amazon.eg/s?i=beauty&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100&page=2",
-    "fashion":        "https://www.amazon.eg/s?i=apparel&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
-    "fashion_p2":     "https://www.amazon.eg/s?i=apparel&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100&page=2",
-    "home":           "https://www.amazon.eg/s?i=home-kitchen&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
-    "home_p2":        "https://www.amazon.eg/s?i=home-kitchen&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100&page=2",
-    "supermarket":    "https://www.amazon.eg/s?i=grocery&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
-    "supermarket_p2": "https://www.amazon.eg/s?i=grocery&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100&page=2",
-}
-
-SCRAPE_HEADERS = {
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/126.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
 }
 
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+# ─── 14 departments × 2 pages each ───────────────────────────────────────────
+DEAL_FILTER = "p_n_deal_type%3A26462622031"
+
+CATEGORIES = {
+    "إلكترونيات": [
+        f"https://www.amazon.eg/s?i=electronics&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=electronics&rh={DEAL_FILTER}&page=2",
+    ],
+    "موبايل وتابلت": [
+        f"https://www.amazon.eg/s?i=mobile&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=mobile&rh={DEAL_FILTER}&page=2",
+    ],
+    "كمبيوتر ولابتوب": [
+        f"https://www.amazon.eg/s?i=computers&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=computers&rh={DEAL_FILTER}&page=2",
+    ],
+    "منزل ومطبخ": [
+        f"https://www.amazon.eg/s?i=kitchen&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=kitchen&rh={DEAL_FILTER}&page=2",
+    ],
+    "جمال وعناية": [
+        f"https://www.amazon.eg/s?i=beauty&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=beauty&rh={DEAL_FILTER}&page=2",
+    ],
+    "أطفال ورضع": [
+        f"https://www.amazon.eg/s?i=baby&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=baby&rh={DEAL_FILTER}&page=2",
+    ],
+    "رياضة وهواء طلق": [
+        f"https://www.amazon.eg/s?i=sporting-goods&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=sporting-goods&rh={DEAL_FILTER}&page=2",
+    ],
+    "كتب": [
+        f"https://www.amazon.eg/s?i=stripbooks&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=stripbooks&rh={DEAL_FILTER}&page=2",
+    ],
+    "ألعاب أطفال": [
+        f"https://www.amazon.eg/s?i=toys&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=toys&rh={DEAL_FILTER}&page=2",
+    ],
+    "ملابس وأزياء": [
+        f"https://www.amazon.eg/s?i=fashion&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=fashion&rh={DEAL_FILTER}&page=2",
+    ],
+    "بقالة وطعام": [
+        f"https://www.amazon.eg/s?i=grocery&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=grocery&rh={DEAL_FILTER}&page=2",
+    ],
+    "سيارات": [
+        f"https://www.amazon.eg/s?i=automotive&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=automotive&rh={DEAL_FILTER}&page=2",
+    ],
+    "صحة وعناية شخصية": [
+        f"https://www.amazon.eg/s?i=hpc&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=hpc&rh={DEAL_FILTER}&page=2",
+    ],
+    "مستلزمات مكتبية": [
+        f"https://www.amazon.eg/s?i=office-products&rh={DEAL_FILTER}&page=1",
+        f"https://www.amazon.eg/s?i=office-products&rh={DEAL_FILTER}&page=2",
+    ],
+}
+
+# ─── State helpers ────────────────────────────────────────────────────────────
 
 def load_state():
-    if os.path.exists(STATE_FILE):
+    if not os.path.exists(STATE_FILE):
+        return {}
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
         try:
-            data = json.load(open(STATE_FILE, encoding="utf-8"))
-            if isinstance(data.get("posted"), list):
-                return {"posted": {}}
-            if "posted" not in data:
-                return {"posted": {}}
-            return data
+            data = json.load(f)
+            return data.get("posted", {})
         except Exception:
-            pass
-    return {"posted": {}}
+            return {}
 
-def save_state(state):
-    now = datetime.now(timezone.utc)
-    pruned = {}
-    for asin, ts in state.get("posted", {}).items():
-        try:
-            posted_at = datetime.fromisoformat(ts)
-            if (now - posted_at).total_seconds() < EXPIRY_HOURS * 3600:
-                pruned[asin] = ts
-        except Exception:
-            pass
+def save_state(posted: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"posted": pruned}, f, indent=2)
+        json.dump({"posted": posted}, f, ensure_ascii=False, indent=2)
 
-def is_already_posted(posted_dict, asin):
-    if asin not in posted_dict:
+def is_posted(asin: str, posted: dict) -> bool:
+    if asin not in posted:
         return False
+    ts = posted[asin]
     try:
-        posted_at = datetime.fromisoformat(posted_dict[asin])
-        hours_ago = (datetime.now(timezone.utc) - posted_at).total_seconds() / 3600
-        return hours_ago < EXPIRY_HOURS
+        t = datetime.fromisoformat(ts)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - t < timedelta(hours=EXPIRY_HOURS)
     except Exception:
         return False
 
-def make_link(asin):
-    return f"https://www.amazon.eg/dp/{asin}?tag={AFFILIATE_TAG}"
-
-def parse_price(text):
-    if not text:
-        return None
-    text = text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
-    text = re.sub(r"[^\d.]", "", text.replace("EGP", "").replace("ج.م", "").replace(",", "").strip())
-    try:
-        return float(text) if text else None
-    except ValueError:
-        return None
-
-def fetch_html(url):
-    for attempt in range(3):
+def mark_posted(asin: str):
+    # Re-read before writing to avoid stomping a concurrent write
+    posted = load_state()
+    posted[asin] = datetime.now(timezone.utc).isoformat()
+    # Purge entries older than 2× expiry to keep the file small
+    now = datetime.now(timezone.utc)
+    clean = {}
+    for k, v in posted.items():
         try:
-            r = requests.get(url, headers=SCRAPE_HEADERS, timeout=25)
-            print(f"  HTTP {r.status_code}")
-            if r.status_code == 200:
-                return r.text
-        except Exception as e:
-            print(f"  Fetch error (attempt {attempt+1}): {e}")
-        time.sleep(4)
-    return None
+            t = datetime.fromisoformat(v)
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            if now - t < timedelta(hours=EXPIRY_HOURS * 2):
+                clean[k] = v
+        except Exception:
+            pass
+    save_state(clean)
 
-def get_product_screenshot_and_title(asin):
-    url = f"https://www.amazon.eg/dp/{asin}"
+# ─── Scrape one search-results page ──────────────────────────────────────────
+
+def parse_price(text: str) -> float:
+    text = (text
+            .replace("EGP", "")
+            .replace("ج.م", "")
+            .replace(",", "")
+            .replace("٬", "")
+            .strip())
+    text = re.sub(r"[^\d.]", "", text)
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-            ctx = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                locale="ar-EG",
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/126.0.0.0 Safari/537.36"
-                ),
-            )
-            page = ctx.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(3000)
+        return float(text)
+    except ValueError:
+        return 0.0
 
-            arabic_title = ""
-            for sel in ["#productTitle", "h1 span", "h1"]:
-                try:
-                    el = page.query_selector(sel)
-                    if el:
-                        t = el.inner_text().strip()
-                        if t:
-                            arabic_title = t
-                            break
-                except Exception:
-                    pass
+def scrape_category(url: str) -> list:
+    candidates = []
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  [WARN] fetch failed {url}: {e}")
+        return candidates
 
-            screenshot_bytes = None
-            if arabic_title:
-                page.evaluate("window.scrollTo(0, 0)")
-                page.wait_for_timeout(500)
-                screenshot_bytes = page.screenshot(full_page=False)
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-            browser.close()
-            return screenshot_bytes, arabic_title
+    for item in soup.select("[data-asin]"):
+        asin = item.get("data-asin", "").strip()
+        if not asin or len(asin) < 8:
+            continue
+
+        # Current price
+        price_el = item.select_one(".a-price .a-offscreen")
+        if not price_el:
+            continue
+        price = parse_price(price_el.get_text())
+        if price <= 0:
+            continue
+
+        # Original / struck-through price
+        orig_price = 0.0
+        for el in item.select(".a-price.a-text-price .a-offscreen"):
+            v = parse_price(el.get_text())
+            if v > price:
+                orig_price = v
+                break
+
+        if orig_price <= price:
+            # Try to back-calculate from a discount badge
+            badge = item.select_one(".savingsPercentage, .a-badge-text")
+            if badge:
+                m = re.search(r"(\d+)%", badge.get_text())
+                if m:
+                    pct = int(m.group(1))
+                    if pct >= MIN_DISCOUNT:
+                        orig_price = round(price / (1 - pct / 100), 2)
+            if orig_price <= price:
+                continue
+
+        discount_pct = round((orig_price - price) / orig_price * 100)
+        if discount_pct < MIN_DISCOUNT:
+            continue
+
+        candidates.append({
+            "asin":         asin,
+            "price":        price,
+            "orig_price":   orig_price,
+            "discount_pct": discount_pct,
+        })
+
+    return candidates
+
+# ─── Product page: Arabic title + screenshot via Playwright ──────────────────
+
+def get_product_details(asin: str, page):
+    url = (
+        f"https://www.amazon.eg/dp/{asin}"
+        f"?tag={AFFILIATE}&language=ar_AE"
+    )
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(2500)  # let lazy elements settle
+
+        title = ""
+        for sel in ["#productTitle", "#title span", "h1.a-size-large"]:
+            el = page.query_selector(sel)
+            if el:
+                t = el.inner_text().strip()
+                # Must contain at least one Arabic character
+                if re.search(r"[\u0600-\u06FF]", t):
+                    title = t
+                    break
+
+        if not title:
+            print(f"  [SKIP] {asin} — no Arabic title")
+            return None
+
+        screenshot_path = f"/tmp/{asin}.png"
+        page.screenshot(path=screenshot_path, full_page=False)
+
+        return {"title": title, "screenshot": screenshot_path}
 
     except Exception as e:
-        print(f"  Browser error for {asin}: {e}")
-        return None, ""
+        print(f"  [WARN] product page error {asin}: {e}")
+        return None
 
-def parse_search_results(html, category):
-    soup  = BeautifulSoup(html, "html.parser")
-    items = []
+# ─── Telegram post ────────────────────────────────────────────────────────────
 
-    page_title = soup.title.get_text(strip=True) if soup.title else "no title"
-    print(f"  Page title: {page_title}")
+def send_telegram(asin, title, price, orig_price, discount_pct, screenshot):
+    affiliate_url = f"https://www.amazon.eg/dp/{asin}?tag={AFFILIATE}"
+    caption = (
+        f"🔥 خصم {discount_pct}% 🔥\n"
+        f"👑 عرض على {title}\n"
+        f"💰 السعر: {price:,.0f} جنيه بدلا من {orig_price:,.0f} جنيه\n"
+        f"🛒 لينك الشراء: {affiliate_url}"
+    )
 
-    cards = soup.select("div[data-component-type='s-search-result']")
-    print(f"  Result cards found: {len(cards)}")
+    api = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-    for card in cards:
-        try:
-            asin = card.get("data-asin", "")
-            if not asin or len(asin) != 10:
-                continue
+    # Try with photo first
+    try:
+        with open(screenshot, "rb") as photo:
+            resp = requests.post(
+                f"{api}/sendPhoto",
+                data={"chat_id": CHANNEL, "caption": caption},
+                files={"photo": photo},
+                timeout=30,
+            )
+        if resp.status_code == 200 and resp.json().get("ok"):
+            print(f"  [OK] {asin} — sent with photo")
+            return True
+        print(f"  [WARN] sendPhoto failed: {resp.text[:200]}")
+    except Exception as e:
+        print(f"  [WARN] sendPhoto exception: {e}")
 
-            title_el = card.select_one("h2 span") or card.select_one("h2 a span")
-            title = title_el.get_text(strip=True) if title_el else ""
-            if not title:
-                continue
-
-            current_price = None
-            for price_el in card.select(".a-price:not(.a-text-price)"):
-                raw = price_el.select_one(".a-offscreen")
-                if raw:
-                    val = parse_price(raw.get_text())
-                    if val and val > 0:
-                        current_price = val
-                        break
-
-            original_price = None
-            for price_el in card.select(".a-text-price"):
-                raw = price_el.select_one(".a-offscreen")
-                if raw:
-                    val = parse_price(raw.get_text())
-                    if val and val > 0:
-                        original_price = val
-                        break
-
-            discount_pct = 0
-            badge = card.select_one(".a-badge-text") or card.select_one("[class*='savingsPercentage']")
-            if badge:
-                m = re.search(r"(\d+)", badge.get_text())
-                if m:
-                    discount_pct = int(m.group(1))
-            if not discount_pct and current_price and original_price and original_price > current_price:
-                discount_pct = round((original_price - current_price) / original_price * 100)
-
-            if discount_pct < 5:
-                continue
-
-            items.append({
-                "asin": asin, "title": title,
-                "current_price": current_price,
-                "original_price": original_price,
-                "discount_pct": discount_pct,
-                "category": category,
-            })
-        except Exception:
-            continue
-
-    return items
-
-def build_caption(item, arabic_title):
-    link  = make_link(item["asin"])
-    lines = []
-
-    if item.get("discount_pct", 0) >= 10:
-        lines.append(f"🔥 خصم {item['discount_pct']}% 🔥")
-
-    lines.append(f"👑 عرض على {arabic_title}")
-    lines.append("")
-
-    if item.get("current_price") and item.get("original_price"):
-        lines.append(
-            f"💰 السعر: {item['current_price']:,.0f} جنيه"
-            f" بدلا من {item['original_price']:,.0f} جنيه"
+    # Fallback: text-only message
+    try:
+        resp = requests.post(
+            f"{api}/sendMessage",
+            json={
+                "chat_id": CHANNEL,
+                "text": caption,
+                "disable_web_page_preview": False,
+            },
+            timeout=30,
         )
-    elif item.get("current_price"):
-        lines.append(f"💰 السعر: {item['current_price']:,.0f} جنيه")
+        if resp.status_code == 200 and resp.json().get("ok"):
+            print(f"  [OK] {asin} — sent text-only")
+            return True
+        print(f"  [ERR] sendMessage failed: {resp.text[:200]}")
+    except Exception as e:
+        print(f"  [ERR] sendMessage exception: {e}")
 
-    lines.append("")
-    lines.append(f"لينك الشراء: {link}")
-    return "\n".join(lines)
+    return False
 
-def post_item(item):
-    print(f"  Launching browser for {item['asin']}...")
-    screenshot_bytes, arabic_title = get_product_screenshot_and_title(item["asin"])
-
-    if not arabic_title:
-        print(f"  No Arabic title — Amazon blocked browser, skipping")
-        return False
-
-    print(f"  Arabic title: {arabic_title[:60]}")
-    caption = build_caption(item, arabic_title)
-
-    r = requests.post(
-        f"{TELEGRAM_API}/sendPhoto",
-        data={"chat_id": DEST_CHANNEL, "caption": caption},
-        files={"photo": ("photo.jpg", screenshot_bytes, "image/jpeg")},
-        timeout=60,
-    )
-    if r.json().get("ok"):
-        return True
-
-    print(f"  sendPhoto failed: {r.json().get('description')} — trying text")
-    r = requests.post(
-        f"{TELEGRAM_API}/sendMessage",
-        json={"chat_id": DEST_CHANNEL, "text": caption},
-        timeout=30,
-    )
-    return r.json().get("ok", False)
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    state       = load_state()
-    posted_dict = state.get("posted", {})
-    total       = 0
+    print(f"[START] {datetime.now(timezone.utc).isoformat()}  MAX_PER_RUN={MAX_PER_RUN}")
 
-    # Collect all unique candidates across all categories
-    all_candidates = []
-    seen_asins     = set()
+    # Load state once for the initial filter pass
+    posted_snapshot = load_state()
 
-    for category, url in CATEGORIES.items():
-        print(f"\n{'='*40}")
-        print(f"Category: {category}")
+    # Collect unique candidates across all categories, skip already-posted
+    seen: set = set()
+    candidates: list = []
 
-        html = fetch_html(url)
-        if not html:
-            print("  SKIPPED — fetch failed")
-            continue
+    for cat_name, urls in CATEGORIES.items():
+        print(f"[CAT] {cat_name}")
+        for url in urls:
+            items = scrape_category(url)
+            print(f"  page {url.split('page=')[-1]} → {len(items)} hits")
+            for item in items:
+                asin = item["asin"]
+                if asin in seen:
+                    continue
+                if is_posted(asin, posted_snapshot):
+                    continue
+                seen.add(asin)
+                item["category"] = cat_name
+                candidates.append(item)
+            time.sleep(1.5)
 
-        items = parse_search_results(html, category)
-        print(f"  Discounted items found: {len(items)}")
+    # Best discounts first
+    candidates.sort(key=lambda x: x["discount_pct"], reverse=True)
+    print(f"[INFO] {len(candidates)} unique new candidates")
 
-        for item in items:
-            if item["asin"] not in seen_asins:
-                seen_asins.add(item["asin"])
-                all_candidates.append(item)
+    if not candidates:
+        print("[DONE] Nothing new to post.")
+        return
 
-    print(f"\n{'='*40}")
-    print(f"Total unique candidates: {len(all_candidates)}")
+    posted_count = 0
 
-    # Post up to MAX_PER_RUN — re-read state before each post
-    for item in all_candidates:
-        if total >= MAX_PER_RUN:
-            break
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            locale="ar-EG",
+            extra_http_headers={"Accept-Language": "ar-EG,ar;q=0.9"},
+        )
+        page = ctx.new_page()
 
-        # Re-read state.json fresh to catch concurrent runs
-        fresh_state  = load_state()
-        fresh_posted = fresh_state.get("posted", {})
+        for c in candidates:
+            if posted_count >= MAX_PER_RUN:
+                break
 
-        if is_already_posted(fresh_posted, item["asin"]):
-            print(f"  Skip {item['asin']} — already posted (fresh check)")
-            continue
+            asin         = c["asin"]
+            price        = c["price"]
+            orig_price   = c["orig_price"]
+            discount_pct = c["discount_pct"]
 
-        ok = post_item(item)
-        status = "OK" if ok else "SKIPPED/FAILED"
-        print(f"  [{status}] {item['asin']} | {item['discount_pct']}% off | {item['title'][:50]}")
+            # Re-read state right before posting — catches duplicate from same run
+            if is_posted(asin, load_state()):
+                print(f"  [SKIP] {asin} — posted in a parallel check")
+                continue
 
-        if ok:
-            fresh_posted[item["asin"]] = now_iso()
-            state["posted"] = fresh_posted
-            save_state(state)
-            total += 1
+            print(f"[ITEM] {asin}  {discount_pct}% off  {price} ← was {orig_price}")
 
-        time.sleep(2)
+            details = get_product_details(asin, page)
+            if not details:
+                continue
 
-    print(f"\n{'='*40}")
-    print(f"Done. Posted: {total}/{MAX_PER_RUN}")
+            ok = send_telegram(
+                asin, details["title"],
+                price, orig_price, discount_pct,
+                details["screenshot"],
+            )
+            if ok:
+                mark_posted(asin)
+                posted_count += 1
+                time.sleep(3)
+
+        ctx.close()
+        browser.close()
+
+    print(f"[DONE] Posted {posted_count} of {MAX_PER_RUN} allowed.")
+
 
 if __name__ == "__main__":
     main()

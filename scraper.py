@@ -1,6 +1,6 @@
 """
 Kashafdeals Amazon.eg Direct Scraper
-- Scrapes discounted items from Amazon.eg search pages
+- Scrapes discounted items from Amazon.eg search pages (page 1 + 2)
 - Takes real browser screenshot of each product page
 - Only posts if Arabic title found (no fallback to product image)
 - Re-reads state before each post to prevent cross-run duplicates
@@ -14,19 +14,25 @@ from playwright.sync_api import sync_playwright
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 DEST_CHANNEL  = os.environ.get("DEST_CHANNEL", "@kashafdeals")
 AFFILIATE_TAG = os.environ.get("AFFILIATE_TAG", "kashafdeals-21")
-MAX_PER_RUN   = int(os.environ.get("MAX_PER_RUN", "3"))
+MAX_PER_RUN   = int(os.environ.get("MAX_PER_RUN", "15"))
 
 TELEGRAM_API  = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_FILE    = "state.json"
 EXPIRY_HOURS  = 48
 
 CATEGORIES = {
-    "deals":       "https://www.amazon.eg/s?s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
-    "electronics": "https://www.amazon.eg/s?i=electronics&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
-    "beauty":      "https://www.amazon.eg/s?i=beauty&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
-    "fashion":     "https://www.amazon.eg/s?i=apparel&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
-    "home":        "https://www.amazon.eg/s?i=home-kitchen&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
-    "supermarket": "https://www.amazon.eg/s?i=grocery&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "deals":          "https://www.amazon.eg/s?s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "deals_p2":       "https://www.amazon.eg/s?s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100&page=2",
+    "electronics":    "https://www.amazon.eg/s?i=electronics&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "electronics_p2": "https://www.amazon.eg/s?i=electronics&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100&page=2",
+    "beauty":         "https://www.amazon.eg/s?i=beauty&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "beauty_p2":      "https://www.amazon.eg/s?i=beauty&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100&page=2",
+    "fashion":        "https://www.amazon.eg/s?i=apparel&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "fashion_p2":     "https://www.amazon.eg/s?i=apparel&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100&page=2",
+    "home":           "https://www.amazon.eg/s?i=home-kitchen&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "home_p2":        "https://www.amazon.eg/s?i=home-kitchen&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100&page=2",
+    "supermarket":    "https://www.amazon.eg/s?i=grocery&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100",
+    "supermarket_p2": "https://www.amazon.eg/s?i=grocery&s=discount-rank&rh=p_n_pct-off-with-tax%3A10-100&page=2",
 }
 
 SCRAPE_HEADERS = {
@@ -223,7 +229,7 @@ def build_caption(item, arabic_title):
     if item.get("current_price") and item.get("original_price"):
         lines.append(
             f"💰 السعر: {item['current_price']:,.0f} جنيه"
-            f" بدلا من {item['original_price']:,.0f} جنيه "
+            f" بدلا من {item['original_price']:,.0f} جنيه"
         )
     elif item.get("current_price"):
         lines.append(f"💰 السعر: {item['current_price']:,.0f} جنيه")
@@ -237,7 +243,7 @@ def post_item(item):
     screenshot_bytes, arabic_title = get_product_screenshot_and_title(item["asin"])
 
     if not arabic_title:
-        print(f"  No Arabic title — Amazon blocked browser, skipping this item")
+        print(f"  No Arabic title — Amazon blocked browser, skipping")
         return False
 
     print(f"  Arabic title: {arabic_title[:60]}")
@@ -265,9 +271,9 @@ def main():
     posted_dict = state.get("posted", {})
     total       = 0
 
-    # Collect all unique candidates across all categories first
+    # Collect all unique candidates across all categories
     all_candidates = []
-    seen_asins = set()
+    seen_asins     = set()
 
     for category, url in CATEGORIES.items():
         print(f"\n{'='*40}")
@@ -289,14 +295,14 @@ def main():
     print(f"\n{'='*40}")
     print(f"Total unique candidates: {len(all_candidates)}")
 
-    # Now post up to MAX_PER_RUN — re-read state before each post
+    # Post up to MAX_PER_RUN — re-read state before each post
     for item in all_candidates:
         if total >= MAX_PER_RUN:
             break
 
         # Re-read state.json fresh to catch concurrent runs
-        fresh_state   = load_state()
-        fresh_posted  = fresh_state.get("posted", {})
+        fresh_state  = load_state()
+        fresh_posted = fresh_state.get("posted", {})
 
         if is_already_posted(fresh_posted, item["asin"]):
             print(f"  Skip {item['asin']} — already posted (fresh check)")
@@ -307,10 +313,8 @@ def main():
         print(f"  [{status}] {item['asin']} | {item['discount_pct']}% off | {item['title'][:50]}")
 
         if ok:
-            # Merge fresh state with our new post
             fresh_posted[item["asin"]] = now_iso()
-            posted_dict = fresh_posted
-            state["posted"] = posted_dict
+            state["posted"] = fresh_posted
             save_state(state)
             total += 1
 

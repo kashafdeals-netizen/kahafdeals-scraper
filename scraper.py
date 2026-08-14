@@ -2,8 +2,8 @@
 Kashafdeals Amazon.eg Direct Scraper
 - Scrapes discounted items from Amazon.eg search pages
 - Takes real browser screenshot of each product page
-- Extracts Arabic title from rendered page
-- Posts in old-style caption format
+- Only posts if Arabic title found (no fallback to product image)
+- Re-reads state before each post to prevent cross-run duplicates
 - State expires after 48h so items can recycle
 """
 import json, os, re, time, requests
@@ -122,7 +122,6 @@ def get_product_screenshot_and_title(asin):
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(3000)
 
-            # Extract Arabic title
             arabic_title = ""
             for sel in ["#productTitle", "h1 span", "h1"]:
                 try:
@@ -135,10 +134,11 @@ def get_product_screenshot_and_title(asin):
                 except Exception:
                     pass
 
-            # Scroll to top so screenshot shows title + image + price
-            page.evaluate("window.scrollTo(0, 0)")
-            page.wait_for_timeout(500)
-            screenshot_bytes = page.screenshot(full_page=False)
+            screenshot_bytes = None
+            if arabic_title:
+                page.evaluate("window.scrollTo(0, 0)")
+                page.wait_for_timeout(500)
+                screenshot_bytes = page.screenshot(full_page=False)
 
             browser.close()
             return screenshot_bytes, arabic_title
@@ -198,19 +198,11 @@ def parse_search_results(html, category):
             if discount_pct < 5:
                 continue
 
-            img_el  = card.select_one("img.s-image") or card.select_one("img")
-            img_url = ""
-            if img_el:
-                img_url = img_el.get("src", "")
-                if img_url.startswith("//"):
-                    img_url = "https:" + img_url
-
             items.append({
                 "asin": asin, "title": title,
                 "current_price": current_price,
                 "original_price": original_price,
                 "discount_pct": discount_pct,
-                "img_url": img_url,
                 "category": category,
             })
         except Exception:
@@ -219,14 +211,13 @@ def parse_search_results(html, category):
     return items
 
 def build_caption(item, arabic_title):
-    name = arabic_title if arabic_title else item["title"]
-    link = make_link(item["asin"])
+    link  = make_link(item["asin"])
     lines = []
 
     if item.get("discount_pct", 0) >= 10:
         lines.append(f"🔥 خصم {item['discount_pct']}% 🔥")
 
-    lines.append(f"👑 عرض على {name}")
+    lines.append(f"👑 عرض على {arabic_title}")
     lines.append("")
 
     if item.get("current_price") and item.get("original_price"):
@@ -244,32 +235,24 @@ def build_caption(item, arabic_title):
 def post_item(item):
     print(f"  Launching browser for {item['asin']}...")
     screenshot_bytes, arabic_title = get_product_screenshot_and_title(item["asin"])
-    print(f"  Arabic title: {arabic_title[:60] if arabic_title else 'not found'}")
 
+    if not arabic_title:
+        print(f"  No Arabic title — Amazon blocked browser, skipping this item")
+        return False
+
+    print(f"  Arabic title: {arabic_title[:60]}")
     caption = build_caption(item, arabic_title)
 
-    # Only use screenshot if we got a real product title (not a login/captcha page)
-    photo_bytes = screenshot_bytes if arabic_title else None
+    r = requests.post(
+        f"{TELEGRAM_API}/sendPhoto",
+        data={"chat_id": DEST_CHANNEL, "caption": caption},
+        files={"photo": ("photo.jpg", screenshot_bytes, "image/jpeg")},
+        timeout=60,
+    )
+    if r.json().get("ok"):
+        return True
 
-    if not photo_bytes and item.get("img_url"):
-        try:
-            r = requests.get(item["img_url"], headers=SCRAPE_HEADERS, timeout=15)
-            if r.status_code == 200 and "image" in r.headers.get("Content-Type", ""):
-                photo_bytes = r.content
-        except Exception:
-            pass
-
-    if photo_bytes:
-        r = requests.post(
-            f"{TELEGRAM_API}/sendPhoto",
-            data={"chat_id": DEST_CHANNEL, "caption": caption},
-            files={"photo": ("photo.jpg", photo_bytes, "image/jpeg")},
-            timeout=60,
-        )
-        if r.json().get("ok"):
-            return True
-        print(f"  sendPhoto failed: {r.json().get('description')} — trying text")
-
+    print(f"  sendPhoto failed: {r.json().get('description')} — trying text")
     r = requests.post(
         f"{TELEGRAM_API}/sendMessage",
         json={"chat_id": DEST_CHANNEL, "text": caption},
@@ -282,10 +265,11 @@ def main():
     posted_dict = state.get("posted", {})
     total       = 0
 
-    for category, url in CATEGORIES.items():
-        if total >= MAX_PER_RUN:
-            break
+    # Collect all unique candidates across all categories first
+    all_candidates = []
+    seen_asins = set()
 
+    for category, url in CATEGORIES.items():
         print(f"\n{'='*40}")
         print(f"Category: {category}")
 
@@ -298,24 +282,40 @@ def main():
         print(f"  Discounted items found: {len(items)}")
 
         for item in items:
-            if total >= MAX_PER_RUN:
-                break
-            if is_already_posted(posted_dict, item["asin"]):
-                print(f"  Skip {item['asin']} — posted within {EXPIRY_HOURS}h")
-                continue
+            if item["asin"] not in seen_asins:
+                seen_asins.add(item["asin"])
+                all_candidates.append(item)
 
-            ok = post_item(item)
-            status = "OK" if ok else "FAILED"
-            print(f"  [{status}] {item['asin']} | {item['discount_pct']}% off | {item['title'][:50]}")
+    print(f"\n{'='*40}")
+    print(f"Total unique candidates: {len(all_candidates)}")
 
-            if ok:
-                posted_dict[item["asin"]] = now_iso()
-                state["posted"] = posted_dict
-                total += 1
+    # Now post up to MAX_PER_RUN — re-read state before each post
+    for item in all_candidates:
+        if total >= MAX_PER_RUN:
+            break
 
-            time.sleep(2)
+        # Re-read state.json fresh to catch concurrent runs
+        fresh_state   = load_state()
+        fresh_posted  = fresh_state.get("posted", {})
 
-    save_state(state)
+        if is_already_posted(fresh_posted, item["asin"]):
+            print(f"  Skip {item['asin']} — already posted (fresh check)")
+            continue
+
+        ok = post_item(item)
+        status = "OK" if ok else "SKIPPED/FAILED"
+        print(f"  [{status}] {item['asin']} | {item['discount_pct']}% off | {item['title'][:50]}")
+
+        if ok:
+            # Merge fresh state with our new post
+            fresh_posted[item["asin"]] = now_iso()
+            posted_dict = fresh_posted
+            state["posted"] = posted_dict
+            save_state(state)
+            total += 1
+
+        time.sleep(2)
+
     print(f"\n{'='*40}")
     print(f"Done. Posted: {total}/{MAX_PER_RUN}")
 

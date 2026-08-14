@@ -223,7 +223,7 @@ def build_caption(item, arabic_title):
     if item.get("current_price") and item.get("original_price"):
         lines.append(
             f"💰 السعر: {item['current_price']:,.0f} جنيه"
-            f" بدلا من {item['original_price']:,.0f} جنيه في موقعهم الرسمي"
+            f" بدلا من {item['original_price']:,.0f} جنيه "
         )
     elif item.get("current_price"):
         lines.append(f"💰 السعر: {item['current_price']:,.0f} جنيه")

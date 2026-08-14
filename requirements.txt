@@ -1,2 +1,2 @@
 requests
-telethon==1.36.0
+beautifulsoup4

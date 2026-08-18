@@ -13,7 +13,7 @@ API_HASH      = os.environ["TELEGRAM_API_HASH"]
 SESSION_STR   = os.environ["TELEGRAM_SESSION"]
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 DEST_CHANNEL  = os.environ.get("DEST_CHANNEL", "@kashafdeals")
-AFFILIATE_TAG = os.environ.get("AFFILIATE_TAG", "arkhashom-21")
+AFFILIATE_TAG = os.environ.get("AFFILIATE_TAG", "kashafdeals-21")
 CHANNELS      = [
     c.strip().lstrip("@").replace("https://t.me/", "")
     for c in os.environ.get("CHANNELS", "EgyptOffersHunter").split(",")

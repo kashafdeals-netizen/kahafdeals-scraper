@@ -1,3 +1,4 @@
 requests
 beautifulsoup4
 playwright
+telethon==1.36.0

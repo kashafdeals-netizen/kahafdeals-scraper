@@ -2,6 +2,7 @@ import os
 import json
 import time
 import re
+import random
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
@@ -10,21 +11,11 @@ from playwright.sync_api import sync_playwright
 # ─── Config ──────────────────────────────────────────────────────────────────
 BOT_TOKEN    = os.environ["BOT_TOKEN"]
 CHANNEL      = "@kashafdeals"
-AFFILIATE    = "arkhashom-21"
+AFFILIATE    = "kashafdeals-21"
 STATE_FILE   = "state.json"
 MAX_PER_RUN  = int(os.environ.get("MAX_PER_RUN", "5"))
 EXPIRY_HOURS = 48
 MIN_DISCOUNT = 10
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-}
 
 # ─── 14 departments × 2 pages each ───────────────────────────────────────────
 DEAL_FILTER = "p_n_deal_type%3A26462622031"
@@ -132,7 +123,7 @@ def mark_posted(asin: str):
             pass
     save_state(clean)
 
-# ─── Scrape one search-results page ──────────────────────────────────────────
+# ─── Scrape search page using Playwright ─────────────────────────────────────
 
 def parse_price(text: str) -> float:
     text = (text
@@ -147,16 +138,27 @@ def parse_price(text: str) -> float:
     except ValueError:
         return 0.0
 
-def scrape_category(url: str) -> list:
+def scrape_category(url: str, page) -> list:
+    """Scrape a search results page using Playwright (avoids 503 blocks)."""
     candidates = []
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"  [WARN] fetch failed {url}: {e}")
-        return candidates
+    retries = 2
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    for attempt in range(retries + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(random.randint(2000, 4000))
+            html = page.content()
+            break
+        except Exception as e:
+            if attempt < retries:
+                wait = (attempt + 1) * 3
+                print(f"  [RETRY] {url} — attempt {attempt+1} failed, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"  [WARN] fetch failed {url}: {e}")
+                return candidates
+
+    soup = BeautifulSoup(html, "html.parser")
 
     for item in soup.select("[data-asin]"):
         asin = item.get("data-asin", "").strip()
@@ -210,7 +212,7 @@ def get_product_details(asin: str, page):
     )
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(2500)
+        page.wait_for_timeout(random.randint(2000, 3500))
 
         title = ""
         for sel in ["#productTitle", "#title span", "h1.a-size-large"]:
@@ -294,38 +296,44 @@ def main():
     seen: set = set()
     candidates: list = []
 
-    for cat_name, urls in CATEGORIES.items():
-        print(f"[CAT] {cat_name}")
-        for url in urls:
-            items = scrape_category(url)
-            print(f"  page {url.split('page=')[-1]} → {len(items)} hits")
-            for item in items:
-                asin = item["asin"]
-                if asin in seen:
-                    continue
-                if is_posted(asin, posted_snapshot):
-                    continue
-                seen.add(asin)
-                item["category"] = cat_name
-                candidates.append(item)
-            time.sleep(1.5)
-
-    candidates.sort(key=lambda x: x["discount_pct"], reverse=True)
-    print(f"[INFO] {len(candidates)} unique new candidates")
-
-    if not candidates:
-        print("[DONE] Nothing new to post.")
-        return
-
-    posted_count = 0
-
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         ctx = browser.new_context(
             locale="ar-EG",
             extra_http_headers={"Accept-Language": "ar-EG,ar;q=0.9"},
+            viewport={"width": 1366, "height": 768},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         )
         page = ctx.new_page()
+
+        # Phase 1: Scrape search pages for candidates
+        for cat_name, urls in CATEGORIES.items():
+            print(f"[CAT] {cat_name}")
+            for url in urls:
+                items = scrape_category(url, page)
+                print(f"  page {url.split('=')[-1]} → {len(items)} hits")
+                for item in items:
+                    asin = item["asin"]
+                    if asin in seen:
+                        continue
+                    if is_posted(asin, posted_snapshot):
+                        continue
+                    seen.add(asin)
+                    item["category"] = cat_name
+                    candidates.append(item)
+                time.sleep(random.uniform(1.5, 3.0))
+
+        candidates.sort(key=lambda x: x["discount_pct"], reverse=True)
+        print(f"[INFO] {len(candidates)} unique new candidates")
+
+        if not candidates:
+            print("[DONE] Nothing new to post.")
+            ctx.close()
+            browser.close()
+            return
+
+        # Phase 2: Get product details and post
+        posted_count = 0
 
         for c in candidates:
             if posted_count >= MAX_PER_RUN:
@@ -354,7 +362,7 @@ def main():
             if ok:
                 mark_posted(asin)
                 posted_count += 1
-                time.sleep(3)
+                time.sleep(random.uniform(2, 4))
 
         ctx.close()
         browser.close()

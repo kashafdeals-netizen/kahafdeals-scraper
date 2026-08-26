@@ -18,19 +18,17 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           pip install requests beautifulsoup4 playwright
-          playwright install chromium
+          playwright install --with-deps chromium
 
       - name: Run scraper
         env:
-          BOT_TOKEN:     ${{ secrets.BOT_TOKEN }}
-          DEST_CHANNEL:  ${{ secrets.DEST_CHANNEL }}
-          AFFILIATE_TAG: ${{ secrets.AFFILIATE_TAG }}
-          MAX_PER_RUN:   ${{ secrets.MAX_PER_RUN }}
+          BOT_TOKEN:   ${{ secrets.BOT_TOKEN }}
+          MAX_PER_RUN: ${{ secrets.MAX_PER_RUN }}
         run: python scraper.py
 
       - name: Save state back to repo

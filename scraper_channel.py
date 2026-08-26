@@ -7,7 +7,7 @@ import asyncio, json, os, re, time
 import requests
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageMediaPhoto
+from telethon.tl.types import MessageMediaPhoto, MessageEntityTextUrl
 
 API_ID        = int(os.environ["TELEGRAM_API_ID"])
 API_HASH      = os.environ["TELEGRAM_API_HASH"]
@@ -35,39 +35,72 @@ def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
-# -- Short link resolution -----------------------------------------------------
+# -- Short link patterns -------------------------------------------------------
 _SHORT_LINK_RE = re.compile(
-    r'https?://(?:link\.amazon|amzn\.to|amzn\.eu|a\.co)[^\s)\]>"\n]*',
+    r'https?://(?:link\.amazon|amzn\.to|amzn\.eu|a\.co)/[^\s)\]>"\n]+',
     re.IGNORECASE
 )
 
+# -- Resolve short links -------------------------------------------------------
 def resolve_short_link(url):
-    """Follow redirects to get the full Amazon URL."""
+    """Resolve short Amazon link to full URL via HTTP redirect."""
     try:
-        resp = requests.head(url, allow_redirects=True, timeout=10,
-                             headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(url, allow_redirects=True, timeout=15,
+                            headers={
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                                "Accept": "text/html,application/xhtml+xml",
+                                "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
+                            })
         final = resp.url
         if "amazon" in final:
-            return final
-        # Try GET if HEAD didn't resolve
-        resp = requests.get(url, allow_redirects=True, timeout=10,
-                            headers={"User-Agent": "Mozilla/5.0"})
-        final = resp.url
-        if "amazon" in final:
+            print(f"  [OK] Resolved: {url} -> {final[:80]}")
             return final
     except Exception as e:
-        print(f"  [WARN] Failed to resolve {url}: {e}")
+        print(f"  [WARN] HTTP resolve failed for {url}: {e}")
     return url
 
-def resolve_all_short_links(text):
-    """Find and resolve all short Amazon links in text."""
+
+def rejoin_split_urls(text):
+    """Fix URLs split across lines: 'https://link.amazon\\n/CODE' -> joined."""
+    text = re.sub(
+        r'(https?://(?:link\.amazon|amzn\.to|amzn\.eu|a\.co))\s*\n\s*(/[A-Za-z0-9_-]+)',
+        r'\1\2',
+        text
+    )
+    return text
+
+
+def extract_entity_urls(msg):
+    """Extract Amazon URLs hidden in TextUrl entities."""
+    urls = []
+    if msg.entities:
+        for ent in msg.entities:
+            if isinstance(ent, MessageEntityTextUrl) and ent.url:
+                if any(x in ent.url for x in ["link.amazon", "amzn.to", "amzn.eu", "a.co", "amazon.eg", "amazon.com"]):
+                    urls.append(ent.url)
+    return urls
+
+
+def resolve_all_short_links(text, entity_urls=None):
+    """Find and resolve all short Amazon links in text + entities."""
+    # First, rejoin URLs that are split across lines
+    text = rejoin_split_urls(text)
+    
+    # Add entity URLs that aren't already in the text
+    if entity_urls:
+        for eu in entity_urls:
+            if eu not in text:
+                text = text + "\n" + eu
+                print(f"  [INFO] Added entity URL: {eu[:60]}")
+    
+    # Find and resolve short links
     short_links = _SHORT_LINK_RE.findall(text)
     for short_url in short_links:
         full_url = resolve_short_link(short_url)
         if full_url != short_url:
             text = text.replace(short_url, full_url)
-            print(f"  Resolved: {short_url} -> {full_url[:70]}...")
     return text
+
 
 # -- Affiliate tag swap --------------------------------------------------------
 _TAG_RE    = re.compile(r'\btag=[^&\s)\]>\n]+')
@@ -102,20 +135,16 @@ _SPAM_PATTERNS = [
 ]
 
 def clean_caption(text):
-    """Remove spam (WhatsApp/Noon/follow-us). Keep title + discount + Amazon link."""
+    """Remove spam. Keep title + discount + Amazon link."""
     if not text:
         return text
-
     for pattern in _SPAM_PATTERNS:
         text = pattern.sub("", text)
-
     # Remove non-Amazon links
     text = re.sub(
         r'https?://(?!(?:www\.)?amazon\.|link\.amazon|amzn)[^\s)\]>"\n]*',
         "", text
     )
-
-    # Clean up whitespace
     lines = [line.strip() for line in text.split("\n")]
     lines = [line for line in lines if line]
     return "\n".join(lines).strip()
@@ -123,13 +152,10 @@ def clean_caption(text):
 # -- Post to destination -------------------------------------------------------
 def send_post(text, photo_bytes=None):
     """Process text (resolve + swap + clean) and post to destination."""
-    # Step 1: Resolve short links
-    resolved = resolve_all_short_links(text)
+    # Step 1: Swap affiliate tags
+    tagged = swap_tag(text)
 
-    # Step 2: Swap affiliate tags
-    tagged = swap_tag(resolved)
-
-    # Step 3: Clean caption
+    # Step 2: Clean caption
     caption = clean_caption(tagged)
 
     # Skip if no Amazon link after processing
@@ -137,7 +163,6 @@ def send_post(text, photo_bytes=None):
         print("  [SKIP] No Amazon link after processing")
         return False
 
-    # Skip if too short
     if len(caption.strip()) < 10:
         print("  [SKIP] Caption too short after cleaning")
         return False
@@ -203,7 +228,13 @@ async def run():
                     except Exception as e:
                         print(f"  Photo error: {e}")
 
-                ok = send_post(text, photo_bytes)
+                # Extract URLs from TextUrl entities
+                entity_urls = extract_entity_urls(msg)
+
+                # Resolve short links (including from entities)
+                resolved_text = resolve_all_short_links(text, entity_urls)
+
+                ok = send_post(resolved_text, photo_bytes)
                 print(f"  Msg {msg.id}: {'OK' if ok else 'SKIPPED/FAILED'}")
                 if ok:
                     state[channel] = msg.id

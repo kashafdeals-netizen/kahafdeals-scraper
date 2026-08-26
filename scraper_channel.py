@@ -53,11 +53,33 @@ def resolve_short_link(url):
                             })
         final = resp.url
         if "amazon" in final:
-            print(f"  [OK] Resolved: {url} -> {final[:80]}")
-            return final
+            cleaned = clean_amazon_url(final)
+            print(f"  [OK] Resolved: {url} -> {cleaned}")
+            return cleaned
     except Exception as e:
         print(f"  [WARN] HTTP resolve failed for {url}: {e}")
     return url
+
+
+def clean_amazon_url(url):
+    """Strip tracking params from Amazon URL. Keep only dp/ASIN + tag."""
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse(url)
+    
+    # Extract ASIN from path (e.g., /dp/B0CNPG1KN1 or /-/en/dp/B0CNPG1KN1)
+    asin_match = re.search(r'/dp/([A-Z0-9]{10})', parsed.path)
+    if asin_match:
+        asin = asin_match.group(1)
+        return f"https://www.amazon.eg/dp/{asin}?tag={AFFILIATE_TAG}"
+    
+    # For promotion pages, keep the promotion path but strip tracking
+    promo_match = re.search(r'(/promotion/psp/[A-Z0-9]+)', parsed.path)
+    if promo_match:
+        return f"https://www.amazon.eg{promo_match.group(1)}?tag={AFFILIATE_TAG}"
+    
+    # Fallback: keep path, only add tag
+    clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?tag={AFFILIATE_TAG}"
+    return clean
 
 
 def rejoin_split_urls(text):
@@ -110,16 +132,13 @@ _AMAZON_RE = re.compile(
 )
 
 def swap_tag(text):
-    """Replace or add affiliate tag in all Amazon URLs."""
+    """Replace Amazon URLs with clean short versions + affiliate tag."""
     if not text:
         return text
-    result = _TAG_RE.sub(f"tag={AFFILIATE_TAG}", text)
-    def _add(m):
+    def _clean_and_tag(m):
         url = m.group(1)
-        if "tag=" not in url:
-            return url + ("&" if "?" in url else "?") + f"tag={AFFILIATE_TAG}"
-        return url
-    return _AMAZON_RE.sub(_add, result)
+        return clean_amazon_url(url)
+    return _AMAZON_RE.sub(_clean_and_tag, text)
 
 # -- Caption cleaning ----------------------------------------------------------
 _SPAM_PATTERNS = [

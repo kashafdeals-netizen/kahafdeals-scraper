@@ -1,6 +1,7 @@
 """
 Arkhashom Combo Scraper — Forwards multi-item/combo posts.
 Detects: 2+ Amazon links, combo keywords, OR single link resolving to PSP/promotion page.
+Excludes: posts containing blacklisted phrases (e.g. عروض لا تفوت).
 """
 import asyncio, json, os, re, time
 import requests
@@ -33,6 +34,18 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+
+# -- Exclusion filter ----------------------------------------------------------
+_EXCLUDE_PATTERNS = [
+    re.compile(r'عروض لا تفوت', re.IGNORECASE),
+]
+
+def is_excluded(text):
+    """Skip posts containing blacklisted phrases."""
+    for pattern in _EXCLUDE_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
 
 # -- Link patterns -------------------------------------------------------------
 _SHORT_LINK_RE = re.compile(
@@ -96,16 +109,15 @@ def is_psp_url(url):
 
 
 def resolve_and_check_psp(text, entity_urls):
-    """Resolve short links from text/entities and check if any is a PSP page.
+    """Resolve short links and check if any is a PSP page.
     Returns (is_psp, resolved_url_or_None)."""
     text = rejoin_split_urls(text)
-    short_links = _SHORT_LINK_RE.findall(text)
+    short_links  = _SHORT_LINK_RE.findall(text)
     entity_short = [u for u in (entity_urls or [])
                     if any(x in u for x in ["link.amazon", "amzn.to", "amzn.eu", "a.co"])]
-    # Deduplicate, preserve order
     candidates = list(dict.fromkeys(short_links + entity_short))
 
-    for url in candidates[:3]:  # check up to 3 links
+    for url in candidates[:3]:
         resolved = resolve_short_link(url)
         if is_psp_url(resolved):
             return True, resolved
@@ -256,7 +268,7 @@ async def run():
     async with TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH) as client:
         me = await client.get_me()
         print(f"Logged in as: {me.first_name} (@{me.username})")
-        print(f"Mode: COMBO (2+ links / keywords / PSP promotion links)")
+        print(f"Mode: COMBO (2+ links / keywords / PSP links) — excludes: عروض لا تفوت")
         print(f"Affiliate tag: {AFFILIATE_TAG}")
         print(f"Destination: {DEST_CHANNEL}")
 
@@ -288,13 +300,20 @@ async def run():
                 entity_urls = extract_entity_urls(msg)
                 text_for_check = rejoin_split_urls(text)
 
+                # Step 1: Exclusion — skip blacklisted posts entirely
+                if is_excluded(text):
+                    print(f"  Msg {msg.id}: SKIP (excluded phrase)")
+                    state[channel] = msg.id
+                    skipped += 1
+                    continue
+
                 combo_type = None
 
-                # Check 1: quick combo (2+ links or Arabic keywords)
+                # Step 2: Quick combo check (2+ links or Arabic keywords)
                 if is_combo_post(text_for_check, entity_urls):
                     combo_type = "MULTI-LINK/KEYWORD"
                 else:
-                    # Check 2: single link that resolves to PSP promotion page
+                    # Step 3: Single link — resolve and check for PSP
                     is_psp, psp_url = resolve_and_check_psp(text, entity_urls)
                     if is_psp:
                         combo_type = f"PSP ({psp_url[:60]})"

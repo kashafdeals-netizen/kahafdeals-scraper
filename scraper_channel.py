@@ -62,24 +62,27 @@ def resolve_short_link(url):
 
 
 def clean_amazon_url(url):
-    """Strip tracking params from Amazon URL. Keep only dp/ASIN + tag."""
-    from urllib.parse import urlparse, parse_qs
+    """For product pages: strip to dp/ASIN + tag.
+    For search/events/other pages: preserve query params, just swap tag."""
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
     parsed = urlparse(url)
-    
-    # Extract ASIN from path (e.g., /dp/B0CNPG1KN1 or /-/en/dp/B0CNPG1KN1)
+
+    # Product page — clean to just dp/ASIN + tag
     asin_match = re.search(r'/dp/([A-Z0-9]{10})', parsed.path)
     if asin_match:
         asin = asin_match.group(1)
         return f"https://www.amazon.eg/dp/{asin}?tag={AFFILIATE_TAG}"
-    
-    # For promotion pages, keep the promotion path but strip tracking
-    promo_match = re.search(r'(/promotion/psp/[A-Z0-9]+)', parsed.path)
+
+    # Promotion pages
+    promo_match = re.search(r'(/promotion/psp/[A-Za-z0-9]+)', parsed.path)
     if promo_match:
         return f"https://www.amazon.eg{promo_match.group(1)}?tag={AFFILIATE_TAG}"
-    
-    # Fallback: keep path, only add tag
-    clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?tag={AFFILIATE_TAG}"
-    return clean
+
+    # Search, events, category pages — keep all params, just swap tag
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    params["tag"] = [AFFILIATE_TAG]
+    new_query = urlencode(params, doseq=True)
+    return urlunparse(parsed._replace(query=new_query, netloc="www.amazon.eg"))
 
 
 def rejoin_split_urls(text):
@@ -105,17 +108,14 @@ def extract_entity_urls(msg):
 
 def resolve_all_short_links(text, entity_urls=None):
     """Find and resolve all short Amazon links in text + entities."""
-    # First, rejoin URLs that are split across lines
     text = rejoin_split_urls(text)
-    
-    # Add entity URLs that aren't already in the text
+
     if entity_urls:
         for eu in entity_urls:
             if eu not in text:
                 text = text + "\n" + eu
                 print(f"  [INFO] Added entity URL: {eu[:60]}")
-    
-    # Find and resolve short links
+
     short_links = _SHORT_LINK_RE.findall(text)
     for short_url in short_links:
         full_url = resolve_short_link(short_url)
@@ -132,7 +132,7 @@ _AMAZON_RE = re.compile(
 )
 
 def swap_tag(text):
-    """Replace Amazon URLs with clean short versions + affiliate tag."""
+    """Replace Amazon URLs with clean versions + affiliate tag."""
     if not text:
         return text
     def _clean_and_tag(m):
@@ -159,7 +159,6 @@ def clean_caption(text):
         return text
     for pattern in _SPAM_PATTERNS:
         text = pattern.sub("", text)
-    # Remove non-Amazon links
     text = re.sub(
         r'https?://(?!(?:www\.)?amazon\.|link\.amazon|amzn)[^\s)\]>"\n]*',
         "", text
@@ -171,13 +170,9 @@ def clean_caption(text):
 # -- Post to destination -------------------------------------------------------
 def send_post(text, photo_bytes=None):
     """Process text (resolve + swap + clean) and post to destination."""
-    # Step 1: Swap affiliate tags
     tagged = swap_tag(text)
-
-    # Step 2: Clean caption
     caption = clean_caption(tagged)
 
-    # Skip if no Amazon link after processing
     if not _AMAZON_RE.search(caption) and "amazon" not in caption:
         print("  [SKIP] No Amazon link after processing")
         return False
@@ -186,6 +181,8 @@ def send_post(text, photo_bytes=None):
         print("  [SKIP] Caption too short after cleaning")
         return False
 
+    print(f"  Caption ({len(caption)} chars): {caption[:300]}")
+
     if photo_bytes:
         r = requests.post(
             f"{TELEGRAM_API}/sendPhoto",
@@ -193,8 +190,10 @@ def send_post(text, photo_bytes=None):
             files={"photo": ("photo.jpg", photo_bytes, "image/jpeg")},
             timeout=60,
         )
-        if r.json().get("ok"):
+        resp = r.json()
+        if resp.get("ok"):
             return True
+        print(f"  [ERROR] sendPhoto: {resp.get('description', resp)}")
 
     r = requests.post(
         f"{TELEGRAM_API}/sendMessage",
@@ -202,7 +201,10 @@ def send_post(text, photo_bytes=None):
               "disable_web_page_preview": False},
         timeout=30,
     )
-    return r.json().get("ok", False)
+    resp = r.json()
+    if not resp.get("ok"):
+        print(f"  [ERROR] sendMessage: {resp.get('description', resp)}")
+    return resp.get("ok", False)
 
 # -- Main loop -----------------------------------------------------------------
 async def run():
@@ -247,10 +249,7 @@ async def run():
                     except Exception as e:
                         print(f"  Photo error: {e}")
 
-                # Extract URLs from TextUrl entities
                 entity_urls = extract_entity_urls(msg)
-
-                # Resolve short links (including from entities)
                 resolved_text = resolve_all_short_links(text, entity_urls)
 
                 ok = send_post(resolved_text, photo_bytes)

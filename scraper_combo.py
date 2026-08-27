@@ -1,7 +1,6 @@
 """
-Arkhashom Combo Scraper — Only forwards multi-item/combo posts.
-Monitors channels, filters for posts with 2+ Amazon links or combo keywords,
-resolves short links, cleans captions, and posts to @arkhashomoffers.
+Arkhashom Combo Scraper — Forwards multi-item/combo posts.
+Detects: 2+ Amazon links, combo keywords, OR single link resolving to PSP/promotion page.
 """
 import asyncio, json, os, re, time
 import requests
@@ -35,7 +34,7 @@ def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
-# -- Combo detection -----------------------------------------------------------
+# -- Link patterns -------------------------------------------------------------
 _SHORT_LINK_RE = re.compile(
     r'https?://(?:link\.amazon|amzn\.to|amzn\.eu|a\.co)/[^\s)\]>"\n]+',
     re.IGNORECASE
@@ -45,7 +44,7 @@ _FULL_AMAZON_RE = re.compile(
     re.IGNORECASE
 )
 
-# Keywords that indicate combo/multi-item offers
+# -- Combo detection (quick, no resolution needed) -----------------------------
 _COMBO_KEYWORDS = [
     r'اشتر[يى]\s*\d+.*(?:وو?فر|واحصل|بسعر)',
     r'\d+\s*بسعر\s*\d+',
@@ -59,7 +58,7 @@ _COMBO_PATTERNS = [re.compile(p, re.IGNORECASE | re.MULTILINE) for p in _COMBO_K
 
 
 def is_combo_post(text, entity_urls=None):
-    """Check if a post is a multi-item/combo post."""
+    """Quick check: 2+ links or Arabic combo keywords."""
     short_count  = len(_SHORT_LINK_RE.findall(text))
     full_count   = len(_FULL_AMAZON_RE.findall(text))
     entity_count = len(entity_urls) if entity_urls else 0
@@ -91,19 +90,41 @@ def resolve_short_link(url):
     return url
 
 
+def is_psp_url(url):
+    """Check if a resolved URL is a PSP/promotion combo page."""
+    return "/psp/" in url or "/promotion/" in url
+
+
+def resolve_and_check_psp(text, entity_urls):
+    """Resolve short links from text/entities and check if any is a PSP page.
+    Returns (is_psp, resolved_url_or_None)."""
+    text = rejoin_split_urls(text)
+    short_links = _SHORT_LINK_RE.findall(text)
+    entity_short = [u for u in (entity_urls or [])
+                    if any(x in u for x in ["link.amazon", "amzn.to", "amzn.eu", "a.co"])]
+    # Deduplicate, preserve order
+    candidates = list(dict.fromkeys(short_links + entity_short))
+
+    for url in candidates[:3]:  # check up to 3 links
+        resolved = resolve_short_link(url)
+        if is_psp_url(resolved):
+            return True, resolved
+    return False, None
+
+
 def clean_amazon_url(url):
     """For product pages: strip to dp/ASIN + tag.
     For search/events/other pages: preserve query params, just swap tag."""
     from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
     parsed = urlparse(url)
 
-    # Product page — clean to just dp/ASIN + tag
+    # Product page
     asin_match = re.search(r'/dp/([A-Z0-9]{10})', parsed.path)
     if asin_match:
         asin = asin_match.group(1)
         return f"https://www.amazon.eg/dp/{asin}?tag={AFFILIATE_TAG}"
 
-    # Promotion pages
+    # Promotion/PSP pages
     promo_match = re.search(r'(/promotion/psp/[A-Za-z0-9]+)', parsed.path)
     if promo_match:
         return f"https://www.amazon.eg{promo_match.group(1)}?tag={AFFILIATE_TAG}"
@@ -160,9 +181,7 @@ _AMAZON_RE = re.compile(
 def swap_tag(text):
     if not text:
         return text
-    def _clean_and_tag(m):
-        return clean_amazon_url(m.group(1))
-    return _AMAZON_RE.sub(_clean_and_tag, text)
+    return _AMAZON_RE.sub(lambda m: clean_amazon_url(m.group(1)), text)
 
 # -- Caption cleaning ----------------------------------------------------------
 _SPAM_PATTERNS = [
@@ -237,7 +256,7 @@ async def run():
     async with TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH) as client:
         me = await client.get_me()
         print(f"Logged in as: {me.first_name} (@{me.username})")
-        print(f"Mode: COMBO ONLY (2+ items per post)")
+        print(f"Mode: COMBO (2+ links / keywords / PSP promotion links)")
         print(f"Affiliate tag: {AFFILIATE_TAG}")
         print(f"Destination: {DEST_CHANNEL}")
 
@@ -267,15 +286,26 @@ async def run():
             for msg in new_msgs:
                 text        = msg.message or ""
                 entity_urls = extract_entity_urls(msg)
-
                 text_for_check = rejoin_split_urls(text)
-                if not is_combo_post(text_for_check, entity_urls):
+
+                combo_type = None
+
+                # Check 1: quick combo (2+ links or Arabic keywords)
+                if is_combo_post(text_for_check, entity_urls):
+                    combo_type = "MULTI-LINK/KEYWORD"
+                else:
+                    # Check 2: single link that resolves to PSP promotion page
+                    is_psp, psp_url = resolve_and_check_psp(text, entity_urls)
+                    if is_psp:
+                        combo_type = f"PSP ({psp_url[:60]})"
+
+                if not combo_type:
                     print(f"  Msg {msg.id}: SKIP (single item)")
                     state[channel] = msg.id
                     skipped += 1
                     continue
 
-                print(f"  Msg {msg.id}: COMBO detected!")
+                print(f"  Msg {msg.id}: COMBO detected! [{combo_type}]")
 
                 photo_bytes = None
                 if isinstance(msg.media, MessageMediaPhoto):

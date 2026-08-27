@@ -47,35 +47,27 @@ _FULL_AMAZON_RE = re.compile(
 
 # Keywords that indicate combo/multi-item offers
 _COMBO_KEYWORDS = [
-    r'اشتر[يى]\s*\d+.*(?:وو?فر|واحصل|بسعر)',  # اشتري 2 ووفر / واحصل
-    r'\d+\s*بسعر\s*\d+',                          # 4 بسعر 3
-    r'خصم.*عند شراء\s*\d+',                       # خصم عند شراء 2
-    r'عرض.*(?:من|على)\s+\w+.*\n.*عرض.*(?:من|على)', # multiple "عرض على X" lines
-    r'اشتري\s*\d+\s*واحصل',                       # اشتري 3 واحصل
-    r'buy\s*\d+.*get',                             # buy 2 get 1
-    r'عروض متعددة',                                # multiple offers
+    r'اشتر[يى]\s*\d+.*(?:وو?فر|واحصل|بسعر)',
+    r'\d+\s*بسعر\s*\d+',
+    r'خصم.*عند شراء\s*\d+',
+    r'عرض.*(?:من|على)\s+\w+.*\n.*عرض.*(?:من|على)',
+    r'اشتري\s*\d+\s*واحصل',
+    r'buy\s*\d+.*get',
+    r'عروض متعددة',
 ]
 _COMBO_PATTERNS = [re.compile(p, re.IGNORECASE | re.MULTILINE) for p in _COMBO_KEYWORDS]
 
 
 def is_combo_post(text, entity_urls=None):
     """Check if a post is a multi-item/combo post."""
-    # Count Amazon links (short + full) in text
-    short_count = len(_SHORT_LINK_RE.findall(text))
-    full_count = len(_FULL_AMAZON_RE.findall(text))
+    short_count  = len(_SHORT_LINK_RE.findall(text))
+    full_count   = len(_FULL_AMAZON_RE.findall(text))
     entity_count = len(entity_urls) if entity_urls else 0
-    
-    total_links = short_count + full_count + entity_count
-    
-    # 2+ Amazon links = combo post
-    if total_links >= 2:
+    if short_count + full_count + entity_count >= 2:
         return True
-    
-    # Check for combo keywords
     for pattern in _COMBO_PATTERNS:
         if pattern.search(text):
             return True
-    
     return False
 
 
@@ -100,23 +92,27 @@ def resolve_short_link(url):
 
 
 def clean_amazon_url(url):
-    """Strip tracking params from Amazon URL. Keep only dp/ASIN + tag."""
-    from urllib.parse import urlparse
+    """For product pages: strip to dp/ASIN + tag.
+    For search/events/other pages: preserve query params, just swap tag."""
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
     parsed = urlparse(url)
-    
-    # Extract ASIN from path
+
+    # Product page — clean to just dp/ASIN + tag
     asin_match = re.search(r'/dp/([A-Z0-9]{10})', parsed.path)
     if asin_match:
         asin = asin_match.group(1)
         return f"https://www.amazon.eg/dp/{asin}?tag={AFFILIATE_TAG}"
-    
+
     # Promotion pages
-    promo_match = re.search(r'(/promotion/psp/[A-Z0-9]+)', parsed.path)
+    promo_match = re.search(r'(/promotion/psp/[A-Za-z0-9]+)', parsed.path)
     if promo_match:
         return f"https://www.amazon.eg{promo_match.group(1)}?tag={AFFILIATE_TAG}"
-    
-    # Fallback
-    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?tag={AFFILIATE_TAG}"
+
+    # Search, events, category pages — keep all params, just swap tag
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    params["tag"] = [AFFILIATE_TAG]
+    new_query = urlencode(params, doseq=True)
+    return urlunparse(parsed._replace(query=new_query, netloc="www.amazon.eg"))
 
 
 def rejoin_split_urls(text):
@@ -143,12 +139,10 @@ def extract_entity_urls(msg):
 def resolve_all_short_links(text, entity_urls=None):
     """Find and resolve all short Amazon links in text + entities."""
     text = rejoin_split_urls(text)
-    
     if entity_urls:
         for eu in entity_urls:
             if eu not in text:
                 text = text + "\n" + eu
-    
     short_links = _SHORT_LINK_RE.findall(text)
     for short_url in short_links:
         full_url = resolve_short_link(short_url)
@@ -164,7 +158,6 @@ _AMAZON_RE = re.compile(
 )
 
 def swap_tag(text):
-    """Replace Amazon URLs with clean short versions + affiliate tag."""
     if not text:
         return text
     def _clean_and_tag(m):
@@ -185,7 +178,6 @@ _SPAM_PATTERNS = [
 ]
 
 def clean_caption(text):
-    """Remove spam. Keep title + discount + Amazon links."""
     if not text:
         return text
     for pattern in _SPAM_PATTERNS:
@@ -200,8 +192,7 @@ def clean_caption(text):
 
 # -- Post to destination -------------------------------------------------------
 def send_post(text, photo_bytes=None):
-    """Process and post combo deal."""
-    tagged = swap_tag(text)
+    tagged  = swap_tag(text)
     caption = clean_caption(tagged)
 
     if not _AMAZON_RE.search(caption) and "amazon" not in caption:
@@ -212,6 +203,8 @@ def send_post(text, photo_bytes=None):
         print("  [SKIP] Caption too short")
         return False
 
+    print(f"  Caption ({len(caption)} chars): {caption[:300]}")
+
     if photo_bytes:
         r = requests.post(
             f"{TELEGRAM_API}/sendPhoto",
@@ -219,8 +212,10 @@ def send_post(text, photo_bytes=None):
             files={"photo": ("photo.jpg", photo_bytes, "image/jpeg")},
             timeout=60,
         )
-        if r.json().get("ok"):
+        resp = r.json()
+        if resp.get("ok"):
             return True
+        print(f"  [ERROR] sendPhoto: {resp.get('description', resp)}")
 
     r = requests.post(
         f"{TELEGRAM_API}/sendMessage",
@@ -228,12 +223,15 @@ def send_post(text, photo_bytes=None):
               "disable_web_page_preview": False},
         timeout=30,
     )
-    return r.json().get("ok", False)
+    resp = r.json()
+    if not resp.get("ok"):
+        print(f"  [ERROR] sendMessage: {resp.get('description', resp)}")
+    return resp.get("ok", False)
 
 # -- Main loop -----------------------------------------------------------------
 async def run():
-    state = load_state()
-    total = 0
+    state   = load_state()
+    total   = 0
     skipped = 0
 
     async with TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH) as client:
@@ -267,11 +265,9 @@ async def run():
             print(f"  {len(new_msgs)} new message(s) since ID {last_id}")
 
             for msg in new_msgs:
-                text = msg.message or ""
+                text        = msg.message or ""
                 entity_urls = extract_entity_urls(msg)
 
-                # COMBO FILTER: only process multi-item posts
-                # Check BEFORE resolving (to save time on single-item posts)
                 text_for_check = rejoin_split_urls(text)
                 if not is_combo_post(text_for_check, entity_urls):
                     print(f"  Msg {msg.id}: SKIP (single item)")

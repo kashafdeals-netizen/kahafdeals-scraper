@@ -11,7 +11,7 @@ from playwright.sync_api import sync_playwright
 # ─── Config ──────────────────────────────────────────────────────────────────
 BOT_TOKEN    = os.environ["BOT_TOKEN"]
 CHANNEL      = "@kashafdeals"
-AFFILIATE    = "kashafdeals-21"
+AFFILIATE    = "arkhashom-21"
 STATE_FILE   = "state.json"
 MAX_PER_RUN  = int(os.environ.get("MAX_PER_RUN", "5"))
 EXPIRY_HOURS = 48

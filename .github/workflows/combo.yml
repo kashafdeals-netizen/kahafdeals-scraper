@@ -2,9 +2,15 @@ name: Arkhashom Combo Scraper
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
 
 permissions:
   contents: write
+
+concurrency:
+  group: combo-scraper
+  cancel-in-progress: false
 
 jobs:
   scrape:
@@ -21,7 +27,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests "telethon==1.36.0"
+        run: pip install requests "telethon==1.36.0" Pillow
 
       - name: Run combo scraper
         env:
@@ -32,7 +38,9 @@ jobs:
           DEST_CHANNEL:       "@arkhashomoffers"
           AFFILIATE_TAG:      "arkhashom-21"
           CHANNELS:           ${{ secrets.CHANNELS }}
-          ALL_CHANNELS:       ${{ secrets.ALL_CHANNELS }}
+          SCRAPE_MODE:        "combo"
+          STATE_FILE:         "state_combo.json"
+          BANNER_PATH:        "arkhashom_banner.png"
         run: python scraper_combo.py
 
       - name: Save state

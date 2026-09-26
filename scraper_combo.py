@@ -6,6 +6,7 @@ ALL_CHANNELS  = forward EVERY post (no combo filter, exclusions still apply).
 SCRAPE_MODE   = combo | all | both  (default both) - lets each cron run one side.
 STATE_FILE    = overridable so the two schedules never fight over one file.
 BANNER_PATH   = banner image pasted under every forwarded photo (optional).
+NO_PHOTO_CHANNELS = channels whose images carry someone else's branding -> text only.
 Excludes: posts containing blacklisted phrases (e.g. عروض لا تفوت).
 """
 import asyncio, json, os, re, time
@@ -20,6 +21,8 @@ SESSION_STR   = os.environ["TELEGRAM_SESSION"]
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 DEST_CHANNEL  = os.environ.get("DEST_CHANNEL", "@arkhashomoffers")
 AFFILIATE_TAG = os.environ.get("AFFILIATE_TAG", "arkhashom-21")
+
+
 def _parse_channels(raw):
     return [
         c.strip().lstrip("@").replace("https://t.me/", "")
@@ -32,6 +35,10 @@ CHANNELS      = _parse_channels(os.environ.get("CHANNELS", "EgyptOffersHunter"))
 # Forward-all channels (every post, no combo filter)
 ALL_CHANNELS  = _parse_channels(os.environ.get("ALL_CHANNELS", ""))
 
+# Channels whose photos are branded by the source - forward text only, so
+# Telegram builds its own preview from the Amazon link instead.
+NO_PHOTO_CHANNELS = _parse_channels(os.environ.get("NO_PHOTO_CHANNELS", ""))
+
 # Which side to run this invocation: "combo", "all", or "both"
 SCRAPE_MODE   = os.environ.get("SCRAPE_MODE", "both").strip().lower()
 if SCRAPE_MODE not in ("combo", "all", "both"):
@@ -40,6 +47,7 @@ if SCRAPE_MODE not in ("combo", "all", "both"):
 STATE_FILE   = os.environ.get("STATE_FILE", "state_combo.json")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+
 # -- State management ----------------------------------------------------------
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -47,14 +55,17 @@ def load_state():
         except Exception: pass
     return {}
 
+
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+
 
 # -- Exclusion filter ----------------------------------------------------------
 _EXCLUDE_PATTERNS = [
     re.compile(r'عروض لا تفوت', re.IGNORECASE),
 ]
+
 
 def is_excluded(text):
     """Skip posts containing blacklisted phrases."""
@@ -62,6 +73,7 @@ def is_excluded(text):
         if pattern.search(text):
             return True
     return False
+
 
 # -- Link patterns -------------------------------------------------------------
 _SHORT_LINK_RE = re.compile(
@@ -206,10 +218,12 @@ _AMAZON_RE = re.compile(
     re.IGNORECASE
 )
 
+
 def swap_tag(text):
     if not text:
         return text
     return _AMAZON_RE.sub(lambda m: clean_amazon_url(m.group(1)), text)
+
 
 # -- Caption cleaning ----------------------------------------------------------
 _SPAM_PATTERNS = [
@@ -224,6 +238,7 @@ _SPAM_PATTERNS = [
     re.compile(r'\U0001F4F1[^\n]*\n', re.IGNORECASE),
 ]
 
+
 def clean_caption(text):
     if not text:
         return text
@@ -237,8 +252,10 @@ def clean_caption(text):
     lines = [line for line in lines if line]
     return "\n".join(lines).strip()
 
+
 # -- Banner overlay ------------------------------------------------------------
 BANNER_PATH = os.environ.get("BANNER_PATH", "arkhashom_banner.png")
+
 
 def brand_photo(photo_bytes):
     """Paste the Arkhashom banner under the forwarded photo. Returns JPEG bytes.
@@ -307,6 +324,7 @@ def send_post(text, photo_bytes=None):
         print(f"  [ERROR] sendMessage: {resp.get('description', resp)}")
     return resp.get("ok", False)
 
+
 # -- Main loop -----------------------------------------------------------------
 async def run():
     state   = load_state()
@@ -321,6 +339,7 @@ async def run():
         print(f"Destination: {DEST_CHANNEL}")
         print(f"Run mode: {SCRAPE_MODE.upper()}  |  state file: {STATE_FILE}")
         print(f"Banner: {BANNER_PATH if os.path.exists(BANNER_PATH) else '(not found - photos sent unbranded)'}")
+        print(f"No-photo channels: {NO_PHOTO_CHANNELS or '(none)'}")
         print(f"Combo-only channels: {CHANNELS or '(none)'}")
         print(f"Forward-all channels: {ALL_CHANNELS or '(none)'}")
 
@@ -393,7 +412,9 @@ async def run():
                 print(f"  Msg {msg.id}: COMBO detected! [{combo_type}]")
 
                 photo_bytes = None
-                if isinstance(msg.media, MessageMediaPhoto):
+                if channel in NO_PHOTO_CHANNELS:
+                    print(f"  Photo skipped - @{channel} is in NO_PHOTO_CHANNELS")
+                elif isinstance(msg.media, MessageMediaPhoto):
                     try:
                         photo_bytes = await client.download_media(msg.media, bytes)
                     except Exception as e:
@@ -410,6 +431,7 @@ async def run():
 
     save_state(state)
     print(f"\nDone. Posted: {total} combos | Skipped: {skipped} single-item posts")
+
 
 if __name__ == "__main__":
     asyncio.run(run())

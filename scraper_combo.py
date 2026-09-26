@@ -1,6 +1,8 @@
 """
 Arkhashom Combo Scraper — Forwards multi-item/combo posts.
 Detects: 2+ Amazon links, combo keywords, OR single link resolving to PSP/promotion page.
+CHANNELS      = combo-only (filtered).
+ALL_CHANNELS  = forward EVERY post (no combo filter, exclusions still apply).
 Excludes: posts containing blacklisted phrases (e.g. عروض لا تفوت).
 """
 import asyncio, json, os, re, time
@@ -15,11 +17,17 @@ SESSION_STR   = os.environ["TELEGRAM_SESSION"]
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 DEST_CHANNEL  = os.environ.get("DEST_CHANNEL", "@arkhashomoffers")
 AFFILIATE_TAG = os.environ.get("AFFILIATE_TAG", "arkhashom-21")
-CHANNELS      = [
-    c.strip().lstrip("@").replace("https://t.me/", "")
-    for c in os.environ.get("CHANNELS", "EgyptOffersHunter").split(",")
-    if c.strip()
-]
+def _parse_channels(raw):
+    return [
+        c.strip().lstrip("@").replace("https://t.me/", "")
+        for c in (raw or "").split(",")
+        if c.strip()
+    ]
+
+# Combo-only channels (filtered: only multi-item / PSP posts)
+CHANNELS      = _parse_channels(os.environ.get("CHANNELS", "EgyptOffersHunter"))
+# Forward-all channels (every post, no combo filter)
+ALL_CHANNELS  = _parse_channels(os.environ.get("ALL_CHANNELS", ""))
 
 STATE_FILE   = "state_combo.json"
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -271,9 +279,15 @@ async def run():
         print(f"Mode: COMBO (2+ links / keywords / PSP links) — excludes: عروض لا تفوت")
         print(f"Affiliate tag: {AFFILIATE_TAG}")
         print(f"Destination: {DEST_CHANNEL}")
+        print(f"Combo-only channels: {CHANNELS or '(none)'}")
+        print(f"Forward-all channels: {ALL_CHANNELS or '(none)'}")
 
-        for channel in CHANNELS:
-            print(f"\n── @{channel} ──")
+        targets = ([(ch, "combo") for ch in CHANNELS]
+                   + [(ch, "all") for ch in ALL_CHANNELS if ch not in CHANNELS])
+
+        for channel, mode in targets:
+            label = "COMBO-ONLY" if mode == "combo" else "FORWARD-ALL"
+            print(f"\n── @{channel} [{label}] ──")
             last_id = state.get(channel, 0)
 
             try:
@@ -309,8 +323,11 @@ async def run():
 
                 combo_type = None
 
+                # Forward-all channel: post everything, skip the combo filter
+                if mode == "all":
+                    combo_type = "FORWARD-ALL"
                 # Step 2: Quick combo check (2+ links or Arabic keywords)
-                if is_combo_post(text_for_check, entity_urls):
+                elif is_combo_post(text_for_check, entity_urls):
                     combo_type = "MULTI-LINK/KEYWORD"
                 else:
                     # Step 3: Single link — resolve and check for PSP

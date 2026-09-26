@@ -3,6 +3,9 @@ Arkhashom Combo Scraper — Forwards multi-item/combo posts.
 Detects: 2+ Amazon links, combo keywords, OR single link resolving to PSP/promotion page.
 CHANNELS      = combo-only (filtered).
 ALL_CHANNELS  = forward EVERY post (no combo filter, exclusions still apply).
+SCRAPE_MODE   = combo | all | both  (default both) - lets each cron run one side.
+STATE_FILE    = overridable so the two schedules never fight over one file.
+BANNER_PATH   = banner image pasted under every forwarded photo (optional).
 Excludes: posts containing blacklisted phrases (e.g. عروض لا تفوت).
 """
 import asyncio, json, os, re, time
@@ -29,7 +32,12 @@ CHANNELS      = _parse_channels(os.environ.get("CHANNELS", "EgyptOffersHunter"))
 # Forward-all channels (every post, no combo filter)
 ALL_CHANNELS  = _parse_channels(os.environ.get("ALL_CHANNELS", ""))
 
-STATE_FILE   = "state_combo.json"
+# Which side to run this invocation: "combo", "all", or "both"
+SCRAPE_MODE   = os.environ.get("SCRAPE_MODE", "both").strip().lower()
+if SCRAPE_MODE not in ("combo", "all", "both"):
+    SCRAPE_MODE = "both"
+
+STATE_FILE   = os.environ.get("STATE_FILE", "state_combo.json")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # -- State management ----------------------------------------------------------
@@ -229,6 +237,37 @@ def clean_caption(text):
     lines = [line for line in lines if line]
     return "\n".join(lines).strip()
 
+# -- Banner overlay ------------------------------------------------------------
+BANNER_PATH = os.environ.get("BANNER_PATH", "arkhashom_banner.png")
+
+def brand_photo(photo_bytes):
+    """Paste the Arkhashom banner under the forwarded photo. Returns JPEG bytes.
+    Any failure returns the original bytes so a post can never be lost."""
+    if not photo_bytes or not os.path.exists(BANNER_PATH):
+        return photo_bytes
+    try:
+        from io import BytesIO
+        from PIL import Image
+        img = Image.open(BytesIO(photo_bytes))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        w, h = img.size
+        banner = Image.open(BANNER_PATH).convert("RGB")
+        bw, bh = banner.size
+        nh = max(1, int(bh * w / bw))
+        banner = banner.resize((w, nh), Image.LANCZOS)
+        out = Image.new("RGB", (w, h + nh), (0, 0, 0))
+        out.paste(img, (0, 0))
+        out.paste(banner, (0, h))
+        buf = BytesIO()
+        out.save(buf, "JPEG", quality=88, optimize=True)
+        print(f"  [OK] Banner added ({w}x{h} -> {w}x{h + nh})")
+        return buf.getvalue()
+    except Exception as e:
+        print(f"  [WARN] Banner overlay failed: {e}")
+        return photo_bytes
+
+
 # -- Post to destination -------------------------------------------------------
 def send_post(text, photo_bytes=None):
     tagged  = swap_tag(text)
@@ -245,6 +284,7 @@ def send_post(text, photo_bytes=None):
     print(f"  Caption ({len(caption)} chars): {caption[:300]}")
 
     if photo_bytes:
+        photo_bytes = brand_photo(photo_bytes)
         r = requests.post(
             f"{TELEGRAM_API}/sendPhoto",
             data={"chat_id": DEST_CHANNEL, "caption": caption},
@@ -279,11 +319,20 @@ async def run():
         print(f"Mode: COMBO (2+ links / keywords / PSP links) — excludes: عروض لا تفوت")
         print(f"Affiliate tag: {AFFILIATE_TAG}")
         print(f"Destination: {DEST_CHANNEL}")
+        print(f"Run mode: {SCRAPE_MODE.upper()}  |  state file: {STATE_FILE}")
+        print(f"Banner: {BANNER_PATH if os.path.exists(BANNER_PATH) else '(not found - photos sent unbranded)'}")
         print(f"Combo-only channels: {CHANNELS or '(none)'}")
         print(f"Forward-all channels: {ALL_CHANNELS or '(none)'}")
 
-        targets = ([(ch, "combo") for ch in CHANNELS]
-                   + [(ch, "all") for ch in ALL_CHANNELS if ch not in CHANNELS])
+        targets = []
+        if SCRAPE_MODE in ("combo", "both"):
+            targets += [(ch, "combo") for ch in CHANNELS]
+        if SCRAPE_MODE in ("all", "both"):
+            skip = set(CHANNELS) if SCRAPE_MODE == "both" else set()
+            targets += [(ch, "all") for ch in ALL_CHANNELS if ch not in skip]
+
+        if not targets:
+            print("No channels to scrape for this mode - nothing to do.")
 
         for channel, mode in targets:
             label = "COMBO-ONLY" if mode == "combo" else "FORWARD-ALL"

@@ -38,7 +38,7 @@ jobs:
           TELEGRAM_API_HASH:  ${{ secrets.TELEGRAM_API_HASH }}
           TELEGRAM_SESSION:   ${{ secrets.TELEGRAM_SESSION_COMBO }}
           BOT_TOKEN:          ${{ secrets.BOT_TOKEN_COMBO }}
-          DEST_CHANNEL:       ${{ secrets.DEST_CHANNEL }}
+          DEST_CHANNEL:       "@arkhashomoffers"
           AFFILIATE_TAG:      ${{ secrets.AFFILIATE_TAG }}
           CHANNELS:           ${{ secrets.CHANNELS }}
           ALL_CHANNELS:       ${{ secrets.ALL_CHANNELS }}

@@ -6,7 +6,10 @@ ALL_CHANNELS  = forward EVERY post (no combo filter, exclusions still apply).
 SCRAPE_MODE   = combo | all | both  (default both) - lets each cron run one side.
 STATE_FILE    = overridable so the two schedules never fight over one file.
 BANNER_PATH   = banner image pasted under every forwarded photo (optional).
-NO_PHOTO_CHANNELS = channels whose images carry someone else's branding -> text only.
+NO_PHOTO_CHANNELS = channels whose images ALWAYS carry someone else's branding -> text only.
+CARD_SIZES        = exact WxH of a competitor's designed card -> that photo is dropped.
+                    Per-IMAGE detection: a gold/coloured frame around the edge also counts,
+                    so plain Amazon screenshots from the same channel still get your banner.
 Excludes: posts containing blacklisted phrases (e.g. عروض لا تفوت).
 """
 import asyncio, json, os, re, time
@@ -35,7 +38,7 @@ CHANNELS      = _parse_channels(os.environ.get("CHANNELS", "EgyptOffersHunter"))
 # Forward-all channels (every post, no combo filter)
 ALL_CHANNELS  = _parse_channels(os.environ.get("ALL_CHANNELS", ""))
 
-# Channels whose photos are branded by the source - forward text only, so
+# Channels whose photos are ALWAYS branded by the source - forward text only, so
 # Telegram builds its own preview from the Amazon link instead.
 NO_PHOTO_CHANNELS = _parse_channels(os.environ.get("NO_PHOTO_CHANNELS", ""))
 
@@ -285,6 +288,76 @@ def brand_photo(photo_bytes):
         return photo_bytes
 
 
+# -- Competitor designed-card detection ---------------------------------------
+# Some channels mix two kinds of images:
+#   (a) plain Amazon page screenshots  -> we want these, with our banner
+#   (b) fully designed cards carrying the source's own logo/frame -> drop the photo
+# Two cheap signals, either one is enough:
+#   1. exact pixel size matches a known card template (CARD_SIZES)
+#   2. a saturated gold/coloured frame runs around the border (screenshots are white)
+def _parse_sizes(raw):
+    out = set()
+    for part in (raw or "").split(","):
+        part = part.strip().lower().replace(" ", "")
+        m = re.fullmatch(r"(\d+)x(\d+)", part)
+        if m:
+            out.add((int(m.group(1)), int(m.group(2))))
+    return out
+
+CARD_SIZES      = _parse_sizes(os.environ.get("CARD_SIZES", "1536x1024"))
+CARD_FRAME_MIN  = float(os.environ.get("CARD_FRAME_MIN", "0.03"))
+
+
+def looks_like_branded_card(img):
+    """True if this image is a designed card from the source channel."""
+    import colorsys
+    w, h = img.size
+
+    if (w, h) in CARD_SIZES:
+        print(f"  [CARD] size {w}x{h} matches a known card template")
+        return True
+
+    try:
+        m  = max(2, int(min(w, h) * 0.04))
+        px = img.load()
+        ring = []
+        step = max(1, w // 200)
+        for x in range(0, w, step):
+            for y in list(range(0, m)) + list(range(h - m, h)):
+                ring.append(px[x, y])
+        step = max(1, h // 200)
+        for y in range(0, h, step):
+            for x in list(range(0, m)) + list(range(w - m, w)):
+                ring.append(px[x, y])
+        if not ring:
+            return False
+        gold = 0
+        for r, g, b in ring:
+            hh, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+            if s > 0.25 and v > 0.35 and 0.06 <= hh <= 0.16:
+                gold += 1
+        frac = gold / len(ring)
+        if frac >= CARD_FRAME_MIN:
+            print(f"  [CARD] gold frame detected on border ({frac:.3f} >= {CARD_FRAME_MIN})")
+            return True
+        print(f"  [PLAIN] no card frame ({frac:.3f}) - banner will be added")
+    except Exception as e:
+        print(f"  [WARN] card detection failed, keeping photo: {e}")
+    return False
+
+
+def is_branded_card_bytes(photo_bytes):
+    if not photo_bytes:
+        return False
+    try:
+        from io import BytesIO
+        from PIL import Image
+        return looks_like_branded_card(Image.open(BytesIO(photo_bytes)).convert("RGB"))
+    except Exception as e:
+        print(f"  [WARN] could not open photo for card check: {e}")
+        return False
+
+
 # -- Post to destination -------------------------------------------------------
 def send_post(text, photo_bytes=None):
     tagged  = swap_tag(text)
@@ -340,6 +413,7 @@ async def run():
         print(f"Run mode: {SCRAPE_MODE.upper()}  |  state file: {STATE_FILE}")
         print(f"Banner: {BANNER_PATH if os.path.exists(BANNER_PATH) else '(not found - photos sent unbranded)'}")
         print(f"No-photo channels: {NO_PHOTO_CHANNELS or '(none)'}")
+        print(f"Card sizes dropped: {sorted(CARD_SIZES) or '(none)'}  |  frame threshold: {CARD_FRAME_MIN}")
         print(f"Combo-only channels: {CHANNELS or '(none)'}")
         print(f"Forward-all channels: {ALL_CHANNELS or '(none)'}")
 
@@ -419,6 +493,9 @@ async def run():
                         photo_bytes = await client.download_media(msg.media, bytes)
                     except Exception as e:
                         print(f"  Photo error: {e}")
+                    if photo_bytes and is_branded_card_bytes(photo_bytes):
+                        print("  Photo dropped - source's own designed card (text only)")
+                        photo_bytes = None
 
                 resolved_text = resolve_all_short_links(text, entity_urls)
 
@@ -426,7 +503,10 @@ async def run():
                 print(f"  Msg {msg.id}: {'OK' if ok else 'FAILED'}")
                 if ok:
                     total += 1
-                state[channel] = msg.id
+                    state[channel] = msg.id
+                else:
+                    print(f"  Msg {msg.id}: state NOT advanced - will retry next run")
+                    break
                 time.sleep(2)
 
     save_state(state)

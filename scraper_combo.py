@@ -1,18 +1,4 @@
-"""
-Arkhashom Combo Scraper — Forwards multi-item/combo posts.
-Detects: 2+ Amazon links, combo keywords, OR single link resolving to PSP/promotion page.
-CHANNELS      = combo-only (filtered).
-ALL_CHANNELS  = forward EVERY post (no combo filter, exclusions still apply).
-SCRAPE_MODE   = combo | all | both  (default both) - lets each cron run one side.
-STATE_FILE    = overridable so the two schedules never fight over one file.
-BANNER_PATH   = banner image pasted under every forwarded photo (optional).
-NO_PHOTO_CHANNELS = channels whose images ALWAYS carry someone else's branding -> text only.
-CARD_SIZES        = exact WxH of a competitor's designed card -> that photo is dropped.
-                    Per-IMAGE detection: a gold/coloured frame around the edge also counts,
-                    so plain Amazon screenshots from the same channel still get your banner.
-FORWARD_WITHOUT_LINK = 1 to forward link-less posts too (forward-all mode only).
-Excludes: posts containing blacklisted phrases (e.g. عروض لا تفوت).
-"""
+"""Arkhashom Combo Scraper - combo / forward-all, banner, competitor-card filter."""
 import asyncio, json, os, re, time
 import requests
 from telethon import TelegramClient
@@ -25,8 +11,6 @@ SESSION_STR   = os.environ["TELEGRAM_SESSION"]
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 DEST_CHANNEL  = os.environ.get("DEST_CHANNEL", "@arkhashomoffers")
 AFFILIATE_TAG = os.environ.get("AFFILIATE_TAG", "arkhashom-21")
-
-
 def _parse_channels(raw):
     return [
         c.strip().lstrip("@").replace("https://t.me/", "")
@@ -34,54 +18,39 @@ def _parse_channels(raw):
         if c.strip()
     ]
 
-# Combo-only channels (filtered: only multi-item / PSP posts)
 CHANNELS      = _parse_channels(os.environ.get("CHANNELS", "EgyptOffersHunter"))
-# Forward-all channels (every post, no combo filter)
 ALL_CHANNELS  = _parse_channels(os.environ.get("ALL_CHANNELS", ""))
 
-# Channels whose photos are ALWAYS branded by the source - forward text only, so
-# Telegram builds its own preview from the Amazon link instead.
 NO_PHOTO_CHANNELS = _parse_channels(os.environ.get("NO_PHOTO_CHANNELS", ""))
 
-# Which side to run this invocation: "combo", "all", or "both"
 SCRAPE_MODE   = os.environ.get("SCRAPE_MODE", "both").strip().lower()
 if SCRAPE_MODE not in ("combo", "all", "both"):
     SCRAPE_MODE = "both"
 
 STATE_FILE   = os.environ.get("STATE_FILE", "state_combo.json")
-# How many recent messages to read per channel per run (big enough to drain a backlog)
 FETCH_LIMIT  = int(os.environ.get("FETCH_LIMIT", "50"))
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-
-# -- State management ----------------------------------------------------------
 def load_state():
     if os.path.exists(STATE_FILE):
         try: return json.load(open(STATE_FILE, encoding="utf-8"))
         except Exception: pass
     return {}
 
-
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
-
-# -- Exclusion filter ----------------------------------------------------------
 _EXCLUDE_PATTERNS = [
     re.compile(r'عروض لا تفوت', re.IGNORECASE),
 ]
 
-
 def is_excluded(text):
-    """Skip posts containing blacklisted phrases."""
     for pattern in _EXCLUDE_PATTERNS:
         if pattern.search(text):
             return True
     return False
 
-
-# -- Link patterns -------------------------------------------------------------
 _SHORT_LINK_RE = re.compile(
     r'https?://(?:link\.amazon|amzn\.to|amzn\.eu|a\.co)/[^\s)\]>"\n]+',
     re.IGNORECASE
@@ -91,7 +60,6 @@ _FULL_AMAZON_RE = re.compile(
     re.IGNORECASE
 )
 
-# -- Combo detection (quick, no resolution needed) -----------------------------
 _COMBO_KEYWORDS = [
     r'اشتر[يى]\s*\d+.*(?:وو?فر|واحصل|بسعر)',
     r'\d+\s*بسعر\s*\d+',
@@ -103,9 +71,7 @@ _COMBO_KEYWORDS = [
 ]
 _COMBO_PATTERNS = [re.compile(p, re.IGNORECASE | re.MULTILINE) for p in _COMBO_KEYWORDS]
 
-
 def is_combo_post(text, entity_urls=None):
-    """Quick check: 2+ links or Arabic combo keywords."""
     short_count  = len(_SHORT_LINK_RE.findall(text))
     full_count   = len(_FULL_AMAZON_RE.findall(text))
     entity_count = len(entity_urls) if entity_urls else 0
@@ -116,10 +82,7 @@ def is_combo_post(text, entity_urls=None):
             return True
     return False
 
-
-# -- Resolve short links -------------------------------------------------------
 def resolve_short_link(url):
-    """Resolve short Amazon link to full URL via HTTP redirect."""
     try:
         resp = requests.get(url, allow_redirects=True, timeout=15,
                             headers={
@@ -136,15 +99,10 @@ def resolve_short_link(url):
         print(f"  [WARN] HTTP resolve failed for {url}: {e}")
     return url
 
-
 def is_psp_url(url):
-    """Check if a resolved URL is a PSP/promotion combo page."""
     return "/psp/" in url or "/promotion/" in url
 
-
 def resolve_and_check_psp(text, entity_urls):
-    """Resolve short links and check if any is a PSP page.
-    Returns (is_psp, resolved_url_or_None)."""
     text = rejoin_split_urls(text)
     short_links  = _SHORT_LINK_RE.findall(text)
     entity_short = [u for u in (entity_urls or [])
@@ -157,33 +115,25 @@ def resolve_and_check_psp(text, entity_urls):
             return True, resolved
     return False, None
 
-
 def clean_amazon_url(url):
-    """For product pages: strip to dp/ASIN + tag.
-    For search/events/other pages: preserve query params, just swap tag."""
     from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
     parsed = urlparse(url)
 
-    # Product page
     asin_match = re.search(r'/dp/([A-Z0-9]{10})', parsed.path)
     if asin_match:
         asin = asin_match.group(1)
         return f"https://www.amazon.eg/dp/{asin}?tag={AFFILIATE_TAG}"
 
-    # Promotion/PSP pages
     promo_match = re.search(r'(/promotion/psp/[A-Za-z0-9]+)', parsed.path)
     if promo_match:
         return f"https://www.amazon.eg{promo_match.group(1)}?tag={AFFILIATE_TAG}"
 
-    # Search, events, category pages — keep all params, just swap tag
     params = parse_qs(parsed.query, keep_blank_values=True)
     params["tag"] = [AFFILIATE_TAG]
     new_query = urlencode(params, doseq=True)
     return urlunparse(parsed._replace(query=new_query, netloc="www.amazon.eg"))
 
-
 def rejoin_split_urls(text):
-    """Fix URLs split across lines."""
     text = re.sub(
         r'(https?://(?:link\.amazon|amzn\.to|amzn\.eu|a\.co))\s*\n\s*(/[A-Za-z0-9_-]+)',
         r'\1\2',
@@ -191,9 +141,7 @@ def rejoin_split_urls(text):
     )
     return text
 
-
 def extract_entity_urls(msg):
-    """Extract Amazon URLs hidden in TextUrl entities."""
     urls = []
     if msg.entities:
         for ent in msg.entities:
@@ -202,9 +150,7 @@ def extract_entity_urls(msg):
                     urls.append(ent.url)
     return urls
 
-
 def resolve_all_short_links(text, entity_urls=None):
-    """Find and resolve all short Amazon links in text + entities."""
     text = rejoin_split_urls(text)
     if entity_urls:
         for eu in entity_urls:
@@ -217,21 +163,16 @@ def resolve_all_short_links(text, entity_urls=None):
             text = text.replace(short_url, full_url)
     return text
 
-
-# -- Affiliate tag swap --------------------------------------------------------
 _AMAZON_RE = re.compile(
     r'(https?://(?:www\.)?amazon\.[a-z.]+/[^\s)\]>"\n]*)',
     re.IGNORECASE
 )
-
 
 def swap_tag(text):
     if not text:
         return text
     return _AMAZON_RE.sub(lambda m: clean_amazon_url(m.group(1)), text)
 
-
-# -- Caption cleaning ----------------------------------------------------------
 _SPAM_PATTERNS = [
     re.compile(r'تابعنا على جميع منصات التواصل[:\s]*', re.IGNORECASE),
     re.compile(r'قناتنا على واتساب[^\n]*', re.IGNORECASE),
@@ -243,7 +184,6 @@ _SPAM_PATTERNS = [
     re.compile(r'\U0001F4F1[^\n]*واتساب[^\n]*', re.IGNORECASE),
     re.compile(r'\U0001F4F1[^\n]*\n', re.IGNORECASE),
 ]
-
 
 def clean_caption(text):
     if not text:
@@ -258,14 +198,9 @@ def clean_caption(text):
     lines = [line for line in lines if line]
     return "\n".join(lines).strip()
 
-
-# -- Banner overlay ------------------------------------------------------------
 BANNER_PATH = os.environ.get("BANNER_PATH", "arkhashom_banner.png")
 
-
 def brand_photo(photo_bytes):
-    """Paste the Arkhashom banner under the forwarded photo. Returns JPEG bytes.
-    Any failure returns the original bytes so a post can never be lost."""
     if not photo_bytes or not os.path.exists(BANNER_PATH):
         return photo_bytes
     try:
@@ -290,14 +225,6 @@ def brand_photo(photo_bytes):
         print(f"  [WARN] Banner overlay failed: {e}")
         return photo_bytes
 
-
-# -- Competitor designed-card detection ---------------------------------------
-# Some channels mix two kinds of images:
-#   (a) plain Amazon page screenshots  -> we want these, with our banner
-#   (b) fully designed cards carrying the source's own logo/frame -> drop the photo
-# Two cheap signals, either one is enough:
-#   1. exact pixel size matches a known card template (CARD_SIZES)
-#   2. a saturated gold/coloured frame runs around the border (screenshots are white)
 def _parse_sizes(raw):
     out = set()
     for part in (raw or "").split(","):
@@ -310,12 +237,9 @@ def _parse_sizes(raw):
 CARD_SIZES      = _parse_sizes(os.environ.get("CARD_SIZES", "1536x1024"))
 CARD_FRAME_MIN  = float(os.environ.get("CARD_FRAME_MIN", "0.03"))
 
-# Forward posts that have no Amazon link at all (forward-all mode only)?
 FORWARD_WITHOUT_LINK = os.environ.get("FORWARD_WITHOUT_LINK", "0").strip() in ("1", "true", "yes")
 
-
 def looks_like_branded_card(img):
-    """True if this image is a designed card from the source channel."""
     import colorsys
     w, h = img.size
 
@@ -351,7 +275,6 @@ def looks_like_branded_card(img):
         print(f"  [WARN] card detection failed, keeping photo: {e}")
     return False
 
-
 def is_branded_card_bytes(photo_bytes):
     if not photo_bytes:
         return False
@@ -363,8 +286,6 @@ def is_branded_card_bytes(photo_bytes):
         print(f"  [WARN] could not open photo for card check: {e}")
         return False
 
-
-# -- Post to destination -------------------------------------------------------
 def send_post(text, photo_bytes=None, allow_no_link=False):
     """Returns "sent" | "skip" (never postable) | "error" (transient, retry)."""
     tagged  = swap_tag(text)
@@ -407,8 +328,6 @@ def send_post(text, photo_bytes=None, allow_no_link=False):
     print(f"  [ERROR] sendMessage: {resp.get('description', resp)}")
     return "error"
 
-
-# -- Main loop -----------------------------------------------------------------
 async def run():
     state   = load_state()
     total   = 0
@@ -466,7 +385,6 @@ async def run():
                 entity_urls = extract_entity_urls(msg)
                 text_for_check = rejoin_split_urls(text)
 
-                # Step 1: Exclusion — skip blacklisted posts entirely
                 if is_excluded(text):
                     print(f"  Msg {msg.id}: SKIP (excluded phrase)")
                     state[channel] = msg.id
@@ -475,14 +393,11 @@ async def run():
 
                 combo_type = None
 
-                # Forward-all channel: post everything, skip the combo filter
                 if mode == "all":
                     combo_type = "FORWARD-ALL"
-                # Step 2: Quick combo check (2+ links or Arabic keywords)
                 elif is_combo_post(text_for_check, entity_urls):
                     combo_type = "MULTI-LINK/KEYWORD"
                 else:
-                    # Step 3: Single link — resolve and check for PSP
                     is_psp, psp_url = resolve_and_check_psp(text, entity_urls)
                     if is_psp:
                         combo_type = f"PSP ({psp_url[:60]})"
@@ -517,4 +432,19 @@ async def run():
                 if status == "sent":
                     print(f"  Msg {msg.id}: OK")
                     total += 1
-                    state[c
+                    state[channel] = msg.id
+                elif status == "skip":
+                    print(f"  Msg {msg.id}: SKIPPED (not postable)")
+                    skipped += 1
+                    state[channel] = msg.id
+                    continue
+                else:
+                    print(f"  Msg {msg.id}: FAILED - state NOT advanced, will retry next run")
+                    break
+                time.sleep(2)
+
+    save_state(state)
+    print(f"\nDone. Posted: {total} combos | Skipped: {skipped} single-item posts")
+
+if __name__ == "__main__":
+    asyncio.run(run())

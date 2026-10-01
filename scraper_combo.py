@@ -10,6 +10,7 @@ NO_PHOTO_CHANNELS = channels whose images ALWAYS carry someone else's branding -
 CARD_SIZES        = exact WxH of a competitor's designed card -> that photo is dropped.
                     Per-IMAGE detection: a gold/coloured frame around the edge also counts,
                     so plain Amazon screenshots from the same channel still get your banner.
+FORWARD_WITHOUT_LINK = 1 to forward link-less posts too (forward-all mode only).
 Excludes: posts containing blacklisted phrases (e.g. عروض لا تفوت).
 """
 import asyncio, json, os, re, time
@@ -48,6 +49,8 @@ if SCRAPE_MODE not in ("combo", "all", "both"):
     SCRAPE_MODE = "both"
 
 STATE_FILE   = os.environ.get("STATE_FILE", "state_combo.json")
+# How many recent messages to read per channel per run (big enough to drain a backlog)
+FETCH_LIMIT  = int(os.environ.get("FETCH_LIMIT", "50"))
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
@@ -307,6 +310,9 @@ def _parse_sizes(raw):
 CARD_SIZES      = _parse_sizes(os.environ.get("CARD_SIZES", "1536x1024"))
 CARD_FRAME_MIN  = float(os.environ.get("CARD_FRAME_MIN", "0.03"))
 
+# Forward posts that have no Amazon link at all (forward-all mode only)?
+FORWARD_WITHOUT_LINK = os.environ.get("FORWARD_WITHOUT_LINK", "0").strip() in ("1", "true", "yes")
+
 
 def looks_like_branded_card(img):
     """True if this image is a designed card from the source channel."""
@@ -359,17 +365,20 @@ def is_branded_card_bytes(photo_bytes):
 
 
 # -- Post to destination -------------------------------------------------------
-def send_post(text, photo_bytes=None):
+def send_post(text, photo_bytes=None, allow_no_link=False):
+    """Returns "sent" | "skip" (never postable) | "error" (transient, retry)."""
     tagged  = swap_tag(text)
     caption = clean_caption(tagged)
 
     if not _AMAZON_RE.search(caption) and "amazon" not in caption:
-        print("  [SKIP] No Amazon link after processing")
-        return False
+        if not allow_no_link:
+            print("  [SKIP] No Amazon link after processing")
+            return "skip"
+        print("  [WARN] No Amazon link, forwarding anyway (FORWARD_WITHOUT_LINK=1)")
 
     if len(caption.strip()) < 10:
         print("  [SKIP] Caption too short")
-        return False
+        return "skip"
 
     print(f"  Caption ({len(caption)} chars): {caption[:300]}")
 
@@ -383,7 +392,7 @@ def send_post(text, photo_bytes=None):
         )
         resp = r.json()
         if resp.get("ok"):
-            return True
+            return "sent"
         print(f"  [ERROR] sendPhoto: {resp.get('description', resp)}")
 
     r = requests.post(
@@ -393,9 +402,10 @@ def send_post(text, photo_bytes=None):
         timeout=30,
     )
     resp = r.json()
-    if not resp.get("ok"):
-        print(f"  [ERROR] sendMessage: {resp.get('description', resp)}")
-    return resp.get("ok", False)
+    if resp.get("ok"):
+        return "sent"
+    print(f"  [ERROR] sendMessage: {resp.get('description', resp)}")
+    return "error"
 
 
 # -- Main loop -----------------------------------------------------------------
@@ -433,7 +443,7 @@ async def run():
             last_id = state.get(channel, 0)
 
             try:
-                messages = await client.get_messages(channel, limit=20)
+                messages = await client.get_messages(channel, limit=FETCH_LIMIT)
             except Exception as e:
                 print(f"  Error: {e}")
                 continue
@@ -499,19 +509,12 @@ async def run():
 
                 resolved_text = resolve_all_short_links(text, entity_urls)
 
-                ok = send_post(resolved_text, photo_bytes)
-                print(f"  Msg {msg.id}: {'OK' if ok else 'FAILED'}")
-                if ok:
+                status = send_post(
+                    resolved_text, photo_bytes,
+                    allow_no_link=(mode == "all" and FORWARD_WITHOUT_LINK),
+                )
+
+                if status == "sent":
+                    print(f"  Msg {msg.id}: OK")
                     total += 1
-                    state[channel] = msg.id
-                else:
-                    print(f"  Msg {msg.id}: state NOT advanced - will retry next run")
-                    break
-                time.sleep(2)
-
-    save_state(state)
-    print(f"\nDone. Posted: {total} combos | Skipped: {skipped} single-item posts")
-
-
-if __name__ == "__main__":
-    asyncio.run(run())
+                    state[c

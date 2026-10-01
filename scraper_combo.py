@@ -1,4 +1,4 @@
-"""Arkhashom Combo Scraper v7 - combo / forward-all, banner, competitor-card filter."""
+"""Arkhashom Combo Scraper v8 - combo / forward-all, banner, competitor-card filter."""
 import asyncio, json, os, re, time
 import requests
 from telethon import TelegramClient
@@ -119,6 +119,8 @@ def resolve_and_check_psp(text, entity_urls):
             return True, resolved
     return False, None
 
+_KEEP_PARAMS = {"k", "rh", "i", "node", "bbn", "s", "field-keywords", "me", "fs"}
+
 def clean_amazon_url(url):
     from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
     parsed = urlparse(url)
@@ -132,10 +134,11 @@ def clean_amazon_url(url):
     if promo_match:
         return f"https://www.amazon.eg{promo_match.group(1)}?tag={AFFILIATE_TAG}"
 
-    params = parse_qs(parsed.query, keep_blank_values=True)
+    params = {k: v for k, v in parse_qs(parsed.query, keep_blank_values=True).items() if k in _KEEP_PARAMS}
     params["tag"] = [AFFILIATE_TAG]
-    new_query = urlencode(params, doseq=True)
-    return urlunparse(parsed._replace(query=new_query, netloc="www.amazon.eg"))
+    path = re.sub(r'/ref=[^/]*$', '', parsed.path)
+    return urlunparse(parsed._replace(path=path, query=urlencode(params, doseq=True),
+                                      netloc="www.amazon.eg", fragment=""))
 
 def rejoin_split_urls(text):
     text = re.sub(
@@ -328,6 +331,31 @@ def is_branded_card_bytes(photo_bytes):
         print(f"  [WARN] could not open photo for card check: {e}")
         return False
 
+LINK_TEXT = os.environ.get("LINK_TEXT", "اضغط هنا 🛒").strip()
+
+def to_html(caption):
+    import html
+    out, last = [], 0
+    for m in _AMAZON_RE.finditer(caption):
+        before = caption[last:m.start()]
+        out.append(html.escape(before, quote=False))
+        if before and not before[-1].isspace():
+            out.append(" ")
+        out.append(f'<a href="{html.escape(m.group(1))}">{html.escape(LINK_TEXT)}</a>')
+        last = m.end()
+    out.append(html.escape(caption[last:], quote=False))
+    return "".join(out)
+
+def _tg(method, payload, files=None):
+    if files:
+        r = requests.post(f"{TELEGRAM_API}/{method}", data=payload, files=files, timeout=60)
+    else:
+        r = requests.post(f"{TELEGRAM_API}/{method}", json=payload, timeout=30)
+    resp = r.json()
+    if not resp.get("ok"):
+        print(f"  [ERROR] {method}: {resp.get('description', resp)}")
+    return bool(resp.get("ok"))
+
 def send_post(text, photo_bytes=None, allow_no_link=False):
     """Returns "sent" | "skip" (never postable) | "error" (transient, retry)."""
     tagged  = swap_tag(text)
@@ -347,27 +375,15 @@ def send_post(text, photo_bytes=None, allow_no_link=False):
 
     if photo_bytes:
         photo_bytes = brand_photo(photo_bytes)
-        r = requests.post(
-            f"{TELEGRAM_API}/sendPhoto",
-            data={"chat_id": DEST_CHANNEL, "caption": caption},
-            files={"photo": ("photo.jpg", photo_bytes, "image/jpeg")},
-            timeout=60,
-        )
-        resp = r.json()
-        if resp.get("ok"):
+    variants = [(to_html(caption), {"parse_mode": "HTML"})] if LINK_TEXT else []
+    variants.append((caption, {}))
+    for body, extra in variants:
+        if photo_bytes and _tg("sendPhoto", {"chat_id": DEST_CHANNEL, "caption": body, **extra},
+                               files={"photo": ("photo.jpg", photo_bytes, "image/jpeg")}):
             return "sent"
-        print(f"  [ERROR] sendPhoto: {resp.get('description', resp)}")
-
-    r = requests.post(
-        f"{TELEGRAM_API}/sendMessage",
-        json={"chat_id": DEST_CHANNEL, "text": caption,
-              "disable_web_page_preview": False},
-        timeout=30,
-    )
-    resp = r.json()
-    if resp.get("ok"):
-        return "sent"
-    print(f"  [ERROR] sendMessage: {resp.get('description', resp)}")
+        if _tg("sendMessage", {"chat_id": DEST_CHANNEL, "text": body,
+                               "disable_web_page_preview": False, **extra}):
+            return "sent"
     return "error"
 
 async def run():

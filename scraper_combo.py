@@ -1,9 +1,10 @@
-"""Arkhashom Combo Scraper - combo / forward-all, banner, competitor-card filter."""
+"""Arkhashom Combo Scraper v7 - combo / forward-all, banner, competitor-card filter."""
 import asyncio, json, os, re, time
 import requests
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageMediaPhoto, MessageEntityTextUrl
+from telethon.tl.types import (MessageMediaPhoto, MessageMediaDocument,
+    MessageMediaWebPage, MessageEntityTextUrl)
 
 API_ID        = int(os.environ["TELEGRAM_API_ID"])
 API_HASH      = os.environ["TELEGRAM_API_HASH"]
@@ -51,8 +52,10 @@ def is_excluded(text):
             return True
     return False
 
+_SHORT_DOMS = r'link\.amazon|amzn\.to|amzn\.eu|a\.co|(?:www\.)?amazon-eg\.net'
+_SHORT_HINTS = ["link.amazon", "amzn.to", "amzn.eu", "a.co", "amazon-eg.net"]
 _SHORT_LINK_RE = re.compile(
-    r'https?://(?:link\.amazon|amzn\.to|amzn\.eu|a\.co)/[^\s)\]>"\n]+',
+    r'https?://(?:' + _SHORT_DOMS + r')/[^\s)\]>"\n]+',
     re.IGNORECASE
 )
 _FULL_AMAZON_RE = re.compile(
@@ -82,14 +85,15 @@ def is_combo_post(text, entity_urls=None):
             return True
     return False
 
+UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
+}
+
 def resolve_short_link(url):
     try:
-        resp = requests.get(url, allow_redirects=True, timeout=15,
-                            headers={
-                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                                "Accept": "text/html,application/xhtml+xml",
-                                "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
-                            })
+        resp = requests.get(url, allow_redirects=True, timeout=15, headers=UA)
         final = resp.url
         if "amazon" in final:
             cleaned = clean_amazon_url(final)
@@ -106,7 +110,7 @@ def resolve_and_check_psp(text, entity_urls):
     text = rejoin_split_urls(text)
     short_links  = _SHORT_LINK_RE.findall(text)
     entity_short = [u for u in (entity_urls or [])
-                    if any(x in u for x in ["link.amazon", "amzn.to", "amzn.eu", "a.co"])]
+                    if any(x in u for x in _SHORT_HINTS)]
     candidates = list(dict.fromkeys(short_links + entity_short))
 
     for url in candidates[:3]:
@@ -135,7 +139,7 @@ def clean_amazon_url(url):
 
 def rejoin_split_urls(text):
     text = re.sub(
-        r'(https?://(?:link\.amazon|amzn\.to|amzn\.eu|a\.co))\s*\n\s*(/[A-Za-z0-9_-]+)',
+        r'(https?://(?:' + _SHORT_DOMS + r'))\s*\n\s*(/[A-Za-z0-9_-]+)',
         r'\1\2',
         text
     )
@@ -146,7 +150,7 @@ def extract_entity_urls(msg):
     if msg.entities:
         for ent in msg.entities:
             if isinstance(ent, MessageEntityTextUrl) and ent.url:
-                if any(x in ent.url for x in ["link.amazon", "amzn.to", "amzn.eu", "a.co", "amazon.eg", "amazon.com"]):
+                if any(x in ent.url for x in _SHORT_HINTS + ["amazon.eg", "amazon.com"]):
                     urls.append(ent.url)
     return urls
 
@@ -182,7 +186,7 @@ _SPAM_PATTERNS = [
     re.compile(r'https?://(?:wa\.me|chat\.whatsapp\.com|t\.me/(?!arkhashom|kashaf))[^\s)\n]*', re.IGNORECASE),
     re.compile(r'https?://(?:www\.)?noon\.com[^\s)\n]*', re.IGNORECASE),
     re.compile(r'\U0001F4F1[^\n]*واتساب[^\n]*', re.IGNORECASE),
-    re.compile(r'\U0001F4F1[^\n]*\n', re.IGNORECASE),
+    re.compile(r'\U0001F4F1[^\n]*', re.IGNORECASE),
 ]
 
 def clean_caption(text):
@@ -210,6 +214,10 @@ def brand_photo(photo_bytes):
         if img.mode != "RGB":
             img = img.convert("RGB")
         w, h = img.size
+        tw = min(max(w, 640), 1280)
+        if tw != w:
+            img = img.resize((tw, max(1, int(h * tw / w))), Image.LANCZOS)
+            w, h = img.size
         banner = Image.open(BANNER_PATH).convert("RGB")
         bw, bh = banner.size
         nh = max(1, int(bh * w / bw))
@@ -235,42 +243,76 @@ def _parse_sizes(raw):
     return out
 
 CARD_SIZES      = _parse_sizes(os.environ.get("CARD_SIZES", "1536x1024"))
-CARD_FRAME_MIN  = float(os.environ.get("CARD_FRAME_MIN", "0.03"))
+CARD_NAVY_MIN   = float(os.environ.get("CARD_NAVY_MIN", "0.30"))
+
+AMAZON_IMG = os.environ.get("AMAZON_IMG_FALLBACK", "1").strip() in ("1", "true", "yes")
+
+async def get_source_photo(client, msg):
+    m = msg.media
+    target = None
+    if isinstance(m, MessageMediaPhoto):
+        target = m
+    elif isinstance(m, MessageMediaDocument):
+        mime = getattr(m.document, "mime_type", "") or ""
+        if mime.startswith("image/") and "gif" not in mime:
+            target = m
+    elif isinstance(m, MessageMediaWebPage):
+        target = getattr(m.webpage, "photo", None)
+    if target is None:
+        return None
+    try:
+        b = await client.download_media(target, bytes)
+        print(f"  [IMG] source photo downloaded ({type(m).__name__})")
+        return b
+    except Exception as e:
+        print(f"  Photo error: {e}")
+        return None
+
+def amazon_photo(text):
+    m = re.search(r'amazon\.eg/(?:[^\s?]*?/)?(?:dp|gp/product)/([A-Z0-9]{10})', text or "")
+    if not m:
+        return None
+    try:
+        h = requests.get(f"https://www.amazon.eg/dp/{m.group(1)}", headers=UA, timeout=15).text
+        u = (re.search(r'"hiRes":"(https://[^"]+)"', h) or re.search(r'data-old-hires="(https://[^"]+)"', h)
+             or re.search(r'"large":"(https://[^"]+)"', h) or re.search(r'og:image" content="([^"]+)"', h))
+        if not u:
+            print(f"  [IMG] no Amazon photo for {m.group(1)} (page blocked?) - text only")
+            return None
+        b = requests.get(u.group(1), timeout=20).content
+        print(f"  [IMG] using Amazon product photo for {m.group(1)}")
+        return b
+    except Exception as e:
+        print(f"  [IMG] Amazon photo failed: {e}")
+        return None
 
 FORWARD_WITHOUT_LINK = os.environ.get("FORWARD_WITHOUT_LINK", "0").strip() in ("1", "true", "yes")
 
 def looks_like_branded_card(img):
     import colorsys
     w, h = img.size
-
     if (w, h) in CARD_SIZES:
         print(f"  [CARD] size {w}x{h} matches a known card template")
         return True
-
     try:
-        m  = max(2, int(min(w, h) * 0.04))
-        px = img.load()
-        ring = []
-        step = max(1, w // 200)
-        for x in range(0, w, step):
-            for y in list(range(0, m)) + list(range(h - m, h)):
-                ring.append(px[x, y])
-        step = max(1, h // 200)
-        for y in range(0, h, step):
-            for x in list(range(0, m)) + list(range(w - m, w)):
-                ring.append(px[x, y])
-        if not ring:
-            return False
-        gold = 0
-        for r, g, b in ring:
-            hh, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
-            if s > 0.25 and v > 0.35 and 0.06 <= hh <= 0.16:
-                gold += 1
-        frac = gold / len(ring)
-        if frac >= CARD_FRAME_MIN:
-            print(f"  [CARD] gold frame detected on border ({frac:.3f} >= {CARD_FRAME_MIN})")
+        sm = img.resize((300, max(1, int(300 * h / w))))
+        sw, sh = sm.size
+        px = sm.load()
+        def navy_frac(x0, y0, x1, y1):
+            n = c = 0
+            for x in range(int(x0 * sw), int(x1 * sw)):
+                for y in range(int(y0 * sh), int(y1 * sh)):
+                    r, g, b = px[x, y]
+                    hh, s_, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+                    n += 1
+                    c += (v < 0.45 and s_ > 0.35 and 0.55 <= hh <= 0.72)
+            return c / max(n, 1)
+        tr = navy_frac(0.62, 0.0, 1.0, 0.25)
+        bl = navy_frac(0.0, 0.8, 0.3, 1.0)
+        if tr >= CARD_NAVY_MIN or bl >= CARD_NAVY_MIN:
+            print(f"  [CARD] navy card corners (top-right {tr:.2f}, bottom-left {bl:.2f})")
             return True
-        print(f"  [PLAIN] no card frame ({frac:.3f}) - banner will be added")
+        print(f"  [PLAIN] normal screenshot (navy {tr:.2f}/{bl:.2f}) - banner will be added")
     except Exception as e:
         print(f"  [WARN] card detection failed, keeping photo: {e}")
     return False
@@ -293,7 +335,7 @@ def send_post(text, photo_bytes=None, allow_no_link=False):
 
     if not _AMAZON_RE.search(caption) and "amazon" not in caption:
         if not allow_no_link:
-            print("  [SKIP] No Amazon link after processing")
+            print(f"  [SKIP] No Amazon link. Text was: {text[:120]!r}")
             return "skip"
         print("  [WARN] No Amazon link, forwarding anyway (FORWARD_WITHOUT_LINK=1)")
 
@@ -336,13 +378,14 @@ async def run():
     async with TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH) as client:
         me = await client.get_me()
         print(f"Logged in as: {me.first_name} (@{me.username})")
-        print(f"Mode: COMBO (2+ links / keywords / PSP links) — excludes: عروض لا تفوت")
+        print(f"Filter: combo channels = 2+ links / keywords / PSP; forward-all = every post. Excludes: عروض لا تفوت")
         print(f"Affiliate tag: {AFFILIATE_TAG}")
         print(f"Destination: {DEST_CHANNEL}")
         print(f"Run mode: {SCRAPE_MODE.upper()}  |  state file: {STATE_FILE}")
         print(f"Banner: {BANNER_PATH if os.path.exists(BANNER_PATH) else '(not found - photos sent unbranded)'}")
         print(f"No-photo channels: {NO_PHOTO_CHANNELS or '(none)'}")
-        print(f"Card sizes dropped: {sorted(CARD_SIZES) or '(none)'}  |  frame threshold: {CARD_FRAME_MIN}")
+        print(f"Amazon photo fallback: {'ON' if AMAZON_IMG else 'OFF'}")
+        print(f"Card sizes dropped: {sorted(CARD_SIZES) or '(none)'}  |  navy threshold: {CARD_NAVY_MIN}")
         print(f"Combo-only channels: {CHANNELS or '(none)'}")
         print(f"Forward-all channels: {ALL_CHANNELS or '(none)'}")
 
@@ -408,21 +451,20 @@ async def run():
                     skipped += 1
                     continue
 
-                print(f"  Msg {msg.id}: COMBO detected! [{combo_type}]")
+                print(f"  Msg {msg.id}: {'FORWARDING' if mode == 'all' else 'COMBO detected!'} [{combo_type}]")
 
                 photo_bytes = None
                 if channel in NO_PHOTO_CHANNELS:
                     print(f"  Photo skipped - @{channel} is in NO_PHOTO_CHANNELS")
-                elif isinstance(msg.media, MessageMediaPhoto):
-                    try:
-                        photo_bytes = await client.download_media(msg.media, bytes)
-                    except Exception as e:
-                        print(f"  Photo error: {e}")
+                else:
+                    photo_bytes = await get_source_photo(client, msg)
                     if photo_bytes and is_branded_card_bytes(photo_bytes):
-                        print("  Photo dropped - source's own designed card (text only)")
+                        print("  Photo dropped - source's own designed card")
                         photo_bytes = None
 
                 resolved_text = resolve_all_short_links(text, entity_urls)
+                if not photo_bytes and AMAZON_IMG and channel not in NO_PHOTO_CHANNELS:
+                    photo_bytes = amazon_photo(resolved_text)
 
                 status = send_post(
                     resolved_text, photo_bytes,
@@ -444,7 +486,7 @@ async def run():
                 time.sleep(2)
 
     save_state(state)
-    print(f"\nDone. Posted: {total} combos | Skipped: {skipped} single-item posts")
+    print(f"\nDone. Posted: {total} | Skipped: {skipped}")
 
 if __name__ == "__main__":
     asyncio.run(run())

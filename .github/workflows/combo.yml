@@ -6,12 +6,13 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: combo-filtered
+  group: arkhashom-telegram-session
   cancel-in-progress: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 

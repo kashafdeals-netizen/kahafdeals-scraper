@@ -1,4 +1,4 @@
-"""Arkhashom Combo Scraper v8 - combo / forward-all, banner, competitor-card filter."""
+"""Arkhashom Combo Scraper v9 - combo / forward-all, banner, competitor-card filter."""
 import asyncio, json, os, re, time
 import requests
 from telethon import TelegramClient
@@ -119,7 +119,8 @@ def resolve_and_check_psp(text, entity_urls):
             return True, resolved
     return False, None
 
-_KEEP_PARAMS = {"k", "rh", "i", "node", "bbn", "s", "field-keywords", "me", "fs"}
+_DROP_PARAMS = {"tag", "linkCode", "linkId", "ref_", "ref", "ascsubtag", "btn_ref", "btn_type",
+                "crid", "sprefix", "qid", "ds", "dc", "_encoding", "ie", "sr", "content-id", "psc", "th"}
 
 def clean_amazon_url(url):
     from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -134,7 +135,7 @@ def clean_amazon_url(url):
     if promo_match:
         return f"https://www.amazon.eg{promo_match.group(1)}?tag={AFFILIATE_TAG}"
 
-    params = {k: v for k, v in parse_qs(parsed.query, keep_blank_values=True).items() if k in _KEEP_PARAMS}
+    params = {k: v for k, v in parse_qs(parsed.query, keep_blank_values=True).items() if k not in _DROP_PARAMS and not k.startswith(("pd_rd", "pf_rd"))}
     params["tag"] = [AFFILIATE_TAG]
     path = re.sub(r'/ref=[^/]*$', '', parsed.path)
     return urlunparse(parsed._replace(path=path, query=urlencode(params, doseq=True),
@@ -332,6 +333,7 @@ def is_branded_card_bytes(photo_bytes):
         return False
 
 LINK_TEXT = os.environ.get("LINK_TEXT", "اضغط هنا 🛒").strip()
+LINK_MAX = int(os.environ.get("LINK_MAX", "120"))
 
 def to_html(caption):
     import html
@@ -341,7 +343,8 @@ def to_html(caption):
         out.append(html.escape(before, quote=False))
         if before and not before[-1].isspace():
             out.append(" ")
-        out.append(f'<a href="{html.escape(m.group(1))}">{html.escape(LINK_TEXT)}</a>')
+        u = html.escape(m.group(1))
+        out.append(u if len(m.group(1)) <= LINK_MAX else f'<a href="{u}">{html.escape(LINK_TEXT)}</a>')
         last = m.end()
     out.append(html.escape(caption[last:], quote=False))
     return "".join(out)

@@ -44,6 +44,7 @@ def save_state(state):
 
 _EXCLUDE_PATTERNS = [
     re.compile(r'عروض لا تفوت', re.IGNORECASE),
+    re.compile(r'بطاق(?:ة|ه|ات)\s+هدايا'),
 ]
 
 def is_excluded(text):
@@ -397,7 +398,7 @@ async def run():
     async with TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH) as client:
         me = await client.get_me()
         print(f"Logged in as: {me.first_name} (@{me.username})")
-        print(f"Filter: combo channels = 2+ links / keywords / PSP; forward-all = every post. Excludes: عروض لا تفوت")
+        print(f"Filter: combo channels = 2+ links / keywords / PSP; forward-all = every post. Excludes: عروض لا تفوت, بطاقات هدايا")
         print(f"Affiliate tag: {AFFILIATE_TAG}")
         print(f"Destination: {DEST_CHANNEL}")
         print(f"Run mode: {SCRAPE_MODE.upper()}  |  state file: {STATE_FILE}")

@@ -1,4 +1,4 @@
-"""Arkhashom Combo Scraper v9 - combo / forward-all, banner, competitor-card filter."""
+"""Arkhashom Combo Scraper v11 - combo / forward-all, banner, card filter, no code posts."""
 import asyncio, json, os, re, time
 import requests
 from telethon import TelegramClient
@@ -45,6 +45,8 @@ def save_state(state):
 _EXCLUDE_PATTERNS = [
     re.compile(r'عروض لا تفوت', re.IGNORECASE),
     re.compile(r'بطاق(?:ة|ه|ات)\s+هدايا'),
+    re.compile(r'(?<![\u0621-\u064A])[وف]?(?:بال|ال|لل|ب|ل)?كود(?![\u0621-\u064A])|برومو\s*كود'),
+    re.compile(r'\b(?:promo\s*)?codes?\b', re.IGNORECASE),
 ]
 
 def is_excluded(text):
@@ -398,7 +400,7 @@ async def run():
     async with TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH) as client:
         me = await client.get_me()
         print(f"Logged in as: {me.first_name} (@{me.username})")
-        print(f"Filter: combo channels = 2+ links / keywords / PSP; forward-all = every post. Excludes: عروض لا تفوت, بطاقات هدايا")
+        print(f"Filter: combo channels = 2+ links / keywords / PSP; forward-all = every post. Excludes: عروض لا تفوت, بطاقات هدايا, كود/code")
         print(f"Affiliate tag: {AFFILIATE_TAG}")
         print(f"Destination: {DEST_CHANNEL}")
         print(f"Run mode: {SCRAPE_MODE.upper()}  |  state file: {STATE_FILE}")

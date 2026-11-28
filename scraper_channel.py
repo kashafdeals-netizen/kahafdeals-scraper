@@ -167,6 +167,21 @@ def clean_caption(text):
     lines = [line for line in lines if line]
     return "\n".join(lines).strip()
 
+# -- No codes from other channels (Amazon.eg Influencers rule) ----------------
+# A post with another creator's promo code is never reposted: Amazon suspends the
+# codes for 3 months, then closes the account. Amazon's own checkbox coupons pass.
+_CODE_PATTERNS = [
+    re.compile(r'(?<![\u0621-\u064A])[وف]?(?:بال|ال|لل|ب|ل)?كود(?![\u0621-\u064A])|برومو\s*كود'),
+    re.compile(r'\b(?:promo\s*|discount\s*|coupon\s*)?codes?\b', re.IGNORECASE),
+    # a code-like token right after use/coupon wording: "استخدم SAVE10", "كوبون: AHMED20", "use SAVE10"
+    re.compile(r'(?:استخدم|استخدمي|استعمل|كوبون|كوبونات|(?i:\b(?:coupon|use)))\s*[:：\-]?\s*(?=[A-Z0-9]*[A-Z])[A-Z0-9]{4,15}\b'),
+]
+
+def has_code(text):
+    """True if the post carries a promo code (code wording, or a CAPS code after use/coupon wording)."""
+    t = re.sub(r'https?://\S+', ' ', text or "")
+    return any(p.search(t) for p in _CODE_PATTERNS)
+
 # -- Post to destination -------------------------------------------------------
 def send_post(text, photo_bytes=None):
     """Process text (resolve + swap + clean) and post to destination."""
@@ -249,13 +264,18 @@ async def run():
                     except Exception as e:
                         print(f"  Photo error: {e}")
 
+                if has_code(text):
+                    print(f"  Msg {msg.id}: SKIP (promo code)")
+                    state[channel] = max(state.get(channel, 0), msg.id)
+                    continue
+
                 entity_urls = extract_entity_urls(msg)
                 resolved_text = resolve_all_short_links(text, entity_urls)
 
                 ok = send_post(resolved_text, photo_bytes)
                 print(f"  Msg {msg.id}: {'OK' if ok else 'SKIPPED/FAILED'}")
                 if ok:
-                    state[channel] = msg.id
+                    state[channel] = max(state.get(channel, 0), msg.id)
                     total += 1
                 time.sleep(2)
 
